@@ -1,0 +1,25 @@
+
+
+==============================================
+LLM Inference Results
+==============================================
+Execution Mode: analytical
+Inference Time for batch: 5.68s
+Prefill Time: 0.069s
+Decode Time: 5.608s
+MTP guesses: 2
+MTP verification positions: 3
+MTP expected tokens per round: 2.6200
+Mean decode latency per output token: 5.476220 ms
+Peak memory per GPU: 15.420166 GiB
+Time to First Token: 0.084s
+Decode Generations per Second: start=183.19, mid(token 512)=182.61, end=182.03
+Aggregate Decode Throughput Tok/s (batch=1, replica_count=1): start=183.19, mid(token 512)=182.61, end=182.03
+
+For more info, turn on debug flags. See examples/llm_astra_inference_debug_graphviz.sh
+Parallelisms: tp:1, cp:1, ep:1, pp:1, dp:1
+Network Topology [dims=1]
+  • dim0 device_fabric : tp 1 × cp 1 × ep 1 × pp 1 × dp 1 ⇒ size 1
+  replica_count: 1 (throughput-only)
+  => aggregate = 1 GPUs per modeled replica
+  => effective total GPUs = 1
