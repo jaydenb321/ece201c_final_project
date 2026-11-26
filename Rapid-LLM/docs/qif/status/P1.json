@@ -1,0 +1,49 @@
+{
+ "plan": "P1",
+ "title": "The Model Matrix",
+ "updated": "2026-08-24",
+ "deliverables": [
+  {
+   "id": "P1.1",
+   "title": "Config schema growth: block-typed layers, SSM / linear-attn / short-conv params, window patterns, per-block FFN dims, depth-shared groups",
+   "status": "done",
+   "report": "config.py carries the block-typed layer schema - layer_plan, ssm, linear_attention (with an optional chunk_size), short_conv, attention.window, attention.output_gate, per-block ffn_dims and shared_weight_groups - each strict-keyed and refused by name when a device class cannot price it. model_param.model_id was added because model_type is a PRICING CARRIER, not an identity; consumers fall back to model_type, so nothing already shipped moves. WAVE D: LLMConfig.num_heads and head_dim on a pure-recurrence config (attention = None, as falcon_mamba_7b is) now raise the named config.NoAttentionBlockError instead of a bare NoneType AttributeError, and it subclasses AttributeError as well as ValueError so every getattr/hasattr probe on the legacy timing path still swallows it and no priced number moves. Covered by tests/test_qif_model_matrix.py (137 tests).",
+   "questions": []
+  },
+  {
+   "id": "P1.2",
+   "title": "hf_to_config.py ingestion of the new fields",
+   "status": "done",
+   "report": "configs/model-config/hf_to_config.py ingests the block-typed schema: layer_types, the Mamba1/Mamba2, gated-DeltaNet and short-conv groups, attn_output_gate, shared_intermediate_size, Qwen3.5's text_config sub-block, LFM2's tie_embedding and MiniCPM3's implied v_head_dim. Sliding-window attention is refused family-agnostically, and a published head_dim is emitted whenever the schema cannot derive it, on any model, so Gemma-3's 256 and Hunyuan-4B's 128 survive the round trip. Tests reproduce every checked-in YAML dim for dim. WAVE D: the granite_4_0_h_1b fixture landed (published config.json verbatim, num_local_experts: 0), closing the last untested importer branch - the dense-Granite path must come out with one expert, first_k_dense_replace = num_layers and no shared_expert ffn_dims entry.",
+   "questions": []
+  },
+  {
+   "id": "P1.3",
+   "title": "P0/P1 model YAMLs with param-total consistency checks (headline: Granite-4.0-H-Tiny per ADJ-1)",
+   "status": "done",
+   "report": "Twelve *_inf.yaml rows ship in configs/model-config/, each dim-verified against its published config.json and cited in a provenance block: the six P0 rows (headline granite_4_0_h_tiny, ADJ-1), two P1 runs-now rows, and the Wave C carriers falcon_h1_3b (3.15B), hunyuan_4b (4.22B) and gemma_3_4b (3.88B text backbone). The remaining P1 matrix rows are deferred, not done. ASSUMPTIONS: three nominal-7B rows (falcon_h1_7b 7.585B, falcon_mamba_7b 7.271B, hunyuan_7b 7.504B) are over the D2 raw cutoff and ship as d2_status: reference, with in-scope siblings as the supported carriers; gemma_3_4b cites the unsloth verbatim mirror because google/gemma-3-4b-pt is gated, names the canonical repo as source_canonical, and its 0.10 tolerance covers the 0.420B SigLIP tower this YAML does not model (D8).",
+   "questions": []
+  },
+  {
+   "id": "P1.4",
+   "title": "Clean named rejection of not-yet-priceable ops by fws_cim until P2-P4 land",
+   "status": "done",
+   "report": "Unpriceable inputs are refused BY NAME on every device class off the mapped fws_cim path: a layer plan naming ssm / linear_attn / short_conv, an active attention.window, attention.output_gate, a non-empty shared_weight_groups and any ffn_dims block -- a declared input priced as if absent is a wrong number, not a missing one. MLA on fws_cim keeps its own gate (minicpm3_4b rejected there, accepted on GPU), and an attention-only plan is not a hybrid and still runs. P1.5, P1.6 and C1 narrowed the rule for mapped runs only, and falcon_h1_3b is refused by name on layer_plan.structure: parallel_branch. Covered by tests in tests/test_fws_cim.py and tests/test_qif_model_matrix.py.",
+   "questions": []
+  },
+  {
+   "id": "P1.5",
+   "title": "Headline model runs end-to-end: Granite-4.0-H-Tiny on the mapped fws_cim path (ADJ-1)",
+   "status": "done",
+   "report": "Granite-4.0-H-Tiny runs end to end on the mapped fws_cim path, shipping granite_4_0_h_tiny_report.json and granite_4_0_h_tiny.json (clean through atlas.html's own loader), both pinned by regenerate-and-compare tests that FAIL rather than skip. Headline: 5610 macros on 10 integer chips, prefill 1.0795 s, 4485.9 tok/s, 194.99 mJ (analog arrays + link traffic; shared-digital, reduction and KV are labelled UNCOVERED in the report itself). THE FINDING: prefill is SCAN-bound -- 36 SSD scans are 79% of it, the four attention layers 8.6%. ASSUMPTIONS: vector_lanes = 1024 is a declared design point; the byte gate compares against fws_eval.report_document regenerated in-process, not against run_perf's own bytes.",
+   "questions": []
+  },
+  {
+   "id": "P1.6",
+   "title": "Second P0 runs end-to-end: Qwen3.5-4B on the mapped fws_cim path (ADJ-1)",
+   "status": "done",
+   "report": "Qwen3.5-4B runs end to end on the mapped path with configs/hardware-config/fws_cim_qwen3_5_4b.yaml, shipping qwen3_5_4b.json and qwen3_5_4b_report.json, both pinned by regenerate-and-compare tests: 729 macros on 8 integer chips, prefill 1.2236 s, 1628.7 tok/s, 410.7 mJ (analog arrays + link traffic; shared-digital, reduction and KV UNCOVERED). attention.output_gate is un-blocked on mapped fws_cim runs ONLY, with W_g an ordinary analog tile and the sigmoid+multiply per-macro pool work. THE FINDING: prefill is shared-digital-bound twice over - 24 delta-rule ops are 53% of the critical path and 8 gated-attention layers another 36%, while every weight matrix sits in idle analog macros. ASSUMPTIONS: W_g is 2560 x 4096, llm_util's own census term, column-parallel. The delta rule is priced RECURRENT because Qwen3.5 declares no chunk size and its ERROR DIRECTION IS NOT CLAIMED (state traffic costs zero on this card, the chunked form retires more ops above Q ~ 34), so model_param.linear_attention.chunk_size is an optional schema field with no default - a default would invent a Q and move a shipped headline.",
+   "questions": []
+  }
+ ]
+}

@@ -1,0 +1,23 @@
+{
+ "astra_times": {},
+ "bundles": {},
+ "dlsim_ok": {},
+ "error_tail": "",
+ "git_rev": "a0f1303",
+ "memory": {
+  "LLM": {
+   "fields": {
+    "hardware_memory_capacity_per_gpu": 80.0,
+    "remaining_memory_headroom": 75.76,
+    "simulated_peak_memory_usage_per_gpu": 4.24,
+    "simulation_mode": "training"
+   },
+   "warnings": []
+  }
+ },
+ "p2p_ok": {},
+ "phase_times": {},
+ "spec_id": "train:analytical:dp1tp1cp2pp2mb2sp0",
+ "status": "ok",
+ "total_time": 0.04880382
+}

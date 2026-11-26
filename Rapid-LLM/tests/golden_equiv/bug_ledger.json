@@ -1,0 +1,5 @@
+{
+ "version": "df-bug-ledger/1",
+ "_doc": "T4 recorded exceptions to the golden records. EMPTY after the 2026-07-29 rebaseline: every structural residual the P5 cutover had declared was either fixed (cross-stage compute anchor, ZeRO-3 sync edges, incidental deps) or absorbed into the recaptured goldens. Entries pin old -> new and expire the moment the goldens are recaptured (test_bug_ledger_entries_are_live).",
+ "entries": []
+}

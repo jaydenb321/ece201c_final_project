@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>QIF Results</title>
+<script>
+  // The results page and the atlas merged: atlas/atlas.html is the one
+  // authoritative page. Old #/m/<model> deep links map to ?model=<model>.
+  var m = (location.hash.match(/#\/m\/([\w.\-]+)/) || [])[1];
+  location.replace("atlas/atlas.html" + (m ? "?model=" + encodeURIComponent(m) : ""));
+</script>
+</head>
+<body>
+<p>The results page moved into the atlas: <a href="atlas/atlas.html">atlas/atlas.html</a> is the one authoritative page.</p>
+</body>
+</html>

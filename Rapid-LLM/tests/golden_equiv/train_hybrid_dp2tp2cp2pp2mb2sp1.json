@@ -1,0 +1,481 @@
+{
+ "astra_times": {
+  "hier/bwd": {
+   "max_sec": 0.001365337,
+   "per_rank_sec": [
+    0.001365337,
+    0.001365337,
+    0.001365337,
+    0.001365337
+   ]
+  },
+  "hier/fwd": {
+   "max_sec": 0.00036021500000000005,
+   "per_rank_sec": [
+    0.00036021500000000005,
+    0.00036021500000000005,
+    0.00036021500000000005,
+    0.00036021500000000005
+   ]
+  }
+ },
+ "bundles": {
+  "hier/bwd": {
+   "bundle_hash": "67280897ccf5a4cab8e3a170f0d04435ecc2c6acea9a26f3c28ddb6580b86efe",
+   "byte_hist_by_kind": {
+    "COLL": {
+     "1048576": 8,
+     "2097152": 8,
+     "524288": 8
+    }
+   },
+   "bytes_by_axis": {
+    "cp": 16777216,
+    "tp": 12582912
+   },
+   "bytes_by_kind": {
+    "COLL": 29360128
+   },
+   "collectives_by_group": {
+    "0,1": {
+     "by_kind": {
+      "2": {
+       "bytes": 2097152,
+       "n": 4
+      },
+      "7": {
+       "bytes": 4194304,
+       "n": 4
+      }
+     },
+     "bytes": 6291456,
+     "n_ops": 8
+    },
+    "0,2": {
+     "by_kind": {
+      "2": {
+       "bytes": 4194304,
+       "n": 2
+      },
+      "7": {
+       "bytes": 4194304,
+       "n": 2
+      }
+     },
+     "bytes": 8388608,
+     "n_ops": 4
+    },
+    "1,3": {
+     "by_kind": {
+      "2": {
+       "bytes": 4194304,
+       "n": 2
+      },
+      "7": {
+       "bytes": 4194304,
+       "n": 2
+      }
+     },
+     "bytes": 8388608,
+     "n_ops": 4
+    },
+    "2,3": {
+     "by_kind": {
+      "2": {
+       "bytes": 2097152,
+       "n": 4
+      },
+      "7": {
+       "bytes": 4194304,
+       "n": 4
+      }
+     },
+     "bytes": 6291456,
+     "n_ops": 8
+    }
+   },
+   "comm_groups": {
+    "1000": [
+     0,
+     1
+    ],
+    "1001": [
+     2,
+     3
+    ],
+    "1002": [
+     0,
+     2
+    ],
+    "1003": [
+     1,
+     3
+    ]
+   },
+   "compute_micros_total": 5388,
+   "manifest": {
+    "npus": 4,
+    "ranks": {
+     "0": {
+      "COMM:2:2097152:null": 1,
+      "COMM:2:524288:null": 2,
+      "COMM:7:1048576:null": 2,
+      "COMM:7:2097152:null": 1,
+      "COMP:110": 1,
+      "COMP:166": 1,
+      "COMP:20": 2,
+      "COMP:31": 2,
+      "COMP:56": 1,
+      "COMP:64": 1,
+      "COMP:765": 1,
+      "COMP:84": 1
+     },
+     "1": {
+      "COMM:2:2097152:null": 1,
+      "COMM:2:524288:null": 2,
+      "COMM:7:1048576:null": 2,
+      "COMM:7:2097152:null": 1,
+      "COMP:110": 1,
+      "COMP:166": 1,
+      "COMP:20": 2,
+      "COMP:31": 2,
+      "COMP:56": 1,
+      "COMP:64": 1,
+      "COMP:765": 1,
+      "COMP:84": 1
+     },
+     "2": {
+      "COMM:2:2097152:null": 1,
+      "COMM:2:524288:null": 2,
+      "COMM:7:1048576:null": 2,
+      "COMM:7:2097152:null": 1,
+      "COMP:110": 1,
+      "COMP:166": 1,
+      "COMP:20": 2,
+      "COMP:31": 2,
+      "COMP:56": 1,
+      "COMP:64": 1,
+      "COMP:765": 1,
+      "COMP:84": 1
+     },
+     "3": {
+      "COMM:2:2097152:null": 1,
+      "COMM:2:524288:null": 2,
+      "COMM:7:1048576:null": 2,
+      "COMM:7:2097152:null": 1,
+      "COMP:110": 1,
+      "COMP:166": 1,
+      "COMP:20": 2,
+      "COMP:31": 2,
+      "COMP:56": 1,
+      "COMP:64": 1,
+      "COMP:765": 1,
+      "COMP:84": 1
+     }
+    },
+    "version": "df-astra-manifest/1"
+   },
+   "manifest_sha256": "e4510ab84197ad46c14a6ec853197d15a610c71ccb46b7424ae0162db55ef9dd",
+   "n_ranks": 4,
+   "n_recv": 0,
+   "n_transfers": 0,
+   "ranks": {
+    "0": {
+     "bytes_by_kind": {
+      "COLL": 7340032
+     },
+     "compute_micros": 1347,
+     "critical_path_nodes": 12,
+     "critical_path_weight": 1356,
+     "dag_hash": "5bf40b053d40351b48bc045f7229a985b4b2a097d0fcf5cec75720c4e70cbc8f",
+     "n_nodes": 16,
+     "op_counts": {
+      "COLL": 6,
+      "COMP": 10
+     },
+     "ops_hash": "95f089d98d2712ff0f9d116a38b2f21aeac9fb016ac27383d946444181fbda9d"
+    },
+    "1": {
+     "bytes_by_kind": {
+      "COLL": 7340032
+     },
+     "compute_micros": 1347,
+     "critical_path_nodes": 12,
+     "critical_path_weight": 1356,
+     "dag_hash": "9daa15b8bcb3b723f258eab2ddf999544b58501656eb47490afad1617acf12d5",
+     "n_nodes": 16,
+     "op_counts": {
+      "COLL": 6,
+      "COMP": 10
+     },
+     "ops_hash": "2569171a079e9942de9bad251d6ec5341a9e65ffcd8df042df34187da8f0554f"
+    },
+    "2": {
+     "bytes_by_kind": {
+      "COLL": 7340032
+     },
+     "compute_micros": 1347,
+     "critical_path_nodes": 12,
+     "critical_path_weight": 1356,
+     "dag_hash": "6cb2f31f45f7c5c827f59236c32911a71a9d2c8797959dc0d0bfb128efd6c10f",
+     "n_nodes": 16,
+     "op_counts": {
+      "COLL": 6,
+      "COMP": 10
+     },
+     "ops_hash": "f4f3d9902034d0241a11a5291123cbe5933c4e634e4cea90122873c7eea68113"
+    },
+    "3": {
+     "bytes_by_kind": {
+      "COLL": 7340032
+     },
+     "compute_micros": 1347,
+     "critical_path_nodes": 12,
+     "critical_path_weight": 1356,
+     "dag_hash": "218baa886fac85ebd6be8c01984b2aad677efb874269a064c40a275b0f6cf5c9",
+     "n_nodes": 16,
+     "op_counts": {
+      "COLL": 6,
+      "COMP": 10
+     },
+     "ops_hash": "8400b3b52386bc2c8d3ae8b5584d1960cd1b19bfcbfd33faea73a9d26dd57b6b"
+    }
+   }
+  },
+  "hier/fwd": {
+   "bundle_hash": "52c8cc073183190a1db71ebd84f5711ba2fee28e9b07cb86d1a7c998bf5d689f",
+   "byte_hist_by_kind": {
+    "COLL": {
+     "1048576": 8,
+     "2097152": 4,
+     "524288": 8
+    }
+   },
+   "bytes_by_axis": {
+    "cp": 4194304,
+    "tp": 16777216
+   },
+   "bytes_by_kind": {
+    "COLL": 20971520
+   },
+   "collectives_by_group": {
+    "0,1": {
+     "by_kind": {
+      "2": {
+       "bytes": 6291456,
+       "n": 6
+      },
+      "7": {
+       "bytes": 2097152,
+       "n": 2
+      }
+     },
+     "bytes": 8388608,
+     "n_ops": 8
+    },
+    "0,2": {
+     "by_kind": {
+      "7": {
+       "bytes": 2097152,
+       "n": 2
+      }
+     },
+     "bytes": 2097152,
+     "n_ops": 2
+    },
+    "1,3": {
+     "by_kind": {
+      "7": {
+       "bytes": 2097152,
+       "n": 2
+      }
+     },
+     "bytes": 2097152,
+     "n_ops": 2
+    },
+    "2,3": {
+     "by_kind": {
+      "2": {
+       "bytes": 6291456,
+       "n": 6
+      },
+      "7": {
+       "bytes": 2097152,
+       "n": 2
+      }
+     },
+     "bytes": 8388608,
+     "n_ops": 8
+    }
+   },
+   "comm_groups": {
+    "1000": [
+     0,
+     1
+    ],
+    "1001": [
+     2,
+     3
+    ],
+    "1002": [
+     0,
+     2
+    ],
+    "1003": [
+     1,
+     3
+    ]
+   },
+   "compute_micros_total": 1412,
+   "manifest": {
+    "npus": 4,
+    "ranks": {
+     "0": {
+      "COMM:2:2097152:null": 1,
+      "COMM:2:524288:null": 2,
+      "COMM:7:1048576:null": 2,
+      "COMP:16": 2,
+      "COMP:17": 1,
+      "COMP:24": 2,
+      "COMP:25": 1,
+      "COMP:26": 1,
+      "COMP:46": 1,
+      "COMP:68": 1,
+      "COMP:91": 1
+     },
+     "1": {
+      "COMM:2:2097152:null": 1,
+      "COMM:2:524288:null": 2,
+      "COMM:7:1048576:null": 2,
+      "COMP:16": 2,
+      "COMP:17": 1,
+      "COMP:24": 2,
+      "COMP:25": 1,
+      "COMP:26": 1,
+      "COMP:46": 1,
+      "COMP:68": 1,
+      "COMP:91": 1
+     },
+     "2": {
+      "COMM:2:2097152:null": 1,
+      "COMM:2:524288:null": 2,
+      "COMM:7:1048576:null": 2,
+      "COMP:16": 2,
+      "COMP:17": 1,
+      "COMP:24": 2,
+      "COMP:25": 1,
+      "COMP:26": 1,
+      "COMP:46": 1,
+      "COMP:68": 1,
+      "COMP:91": 1
+     },
+     "3": {
+      "COMM:2:2097152:null": 1,
+      "COMM:2:524288:null": 2,
+      "COMM:7:1048576:null": 2,
+      "COMP:16": 2,
+      "COMP:17": 1,
+      "COMP:24": 2,
+      "COMP:25": 1,
+      "COMP:26": 1,
+      "COMP:46": 1,
+      "COMP:68": 1,
+      "COMP:91": 1
+     }
+    },
+    "version": "df-astra-manifest/1"
+   },
+   "manifest_sha256": "7b056d2417acd2f09a61b3a4a136be80cce1a127327e1c18935ee2889e11353c",
+   "n_ranks": 4,
+   "n_recv": 0,
+   "n_transfers": 0,
+   "ranks": {
+    "0": {
+     "bytes_by_kind": {
+      "COLL": 5242880
+     },
+     "compute_micros": 353,
+     "critical_path_nodes": 11,
+     "critical_path_weight": 360,
+     "dag_hash": "fb03de34df0721b8d08e3ff3964a923aa4b8b4421f6ab6c70d1701a29a965919",
+     "n_nodes": 15,
+     "op_counts": {
+      "COLL": 5,
+      "COMP": 10
+     },
+     "ops_hash": "8f130b6faf7072e65a129c6e652b68606dc1ad1518f965c3c1487ee027c47dd9"
+    },
+    "1": {
+     "bytes_by_kind": {
+      "COLL": 5242880
+     },
+     "compute_micros": 353,
+     "critical_path_nodes": 11,
+     "critical_path_weight": 360,
+     "dag_hash": "16a5179a462d946005727ad63d10d18fd78f61e21b6dd29aa373bd3317b57f4a",
+     "n_nodes": 15,
+     "op_counts": {
+      "COLL": 5,
+      "COMP": 10
+     },
+     "ops_hash": "b7964102d6192c8d4fe0c735ee43cd411d41f9ac1b82e3135c4e013f148730c0"
+    },
+    "2": {
+     "bytes_by_kind": {
+      "COLL": 5242880
+     },
+     "compute_micros": 353,
+     "critical_path_nodes": 11,
+     "critical_path_weight": 360,
+     "dag_hash": "67125e5fd607f6a40b326f93584c6a12ea649fe1da9fcce788f2d76647e7917a",
+     "n_nodes": 15,
+     "op_counts": {
+      "COLL": 5,
+      "COMP": 10
+     },
+     "ops_hash": "0712fcc56943eafc8aab4b634c764dd1dfb69884f62c660fbdcff09891287df4"
+    },
+    "3": {
+     "bytes_by_kind": {
+      "COLL": 5242880
+     },
+     "compute_micros": 353,
+     "critical_path_nodes": 11,
+     "critical_path_weight": 360,
+     "dag_hash": "93ece9613a75a39e4f63e442f9fa92c4fa515b8741cdec84c9582871d4ad96e3",
+     "n_nodes": 15,
+     "op_counts": {
+      "COLL": 5,
+      "COMP": 10
+     },
+     "ops_hash": "4b11b6be738ca80f39694470089d3f1461d97b3173c1c5d613a724ea707cad9d"
+    }
+   }
+  }
+ },
+ "dlsim_ok": {
+  "hier/bwd": true,
+  "hier/fwd": true
+ },
+ "error_tail": "",
+ "git_rev": "a0f1303",
+ "memory": {
+  "LLM": {
+   "fields": {
+    "hardware_memory_capacity_per_gpu": 80.0,
+    "remaining_memory_headroom": 78.49,
+    "simulated_peak_memory_usage_per_gpu": 1.51,
+    "simulation_mode": "training"
+   },
+   "warnings": []
+  }
+ },
+ "p2p_ok": {
+  "hier/bwd": true,
+  "hier/fwd": true
+ },
+ "phase_times": {},
+ "spec_id": "train:hybrid:dp2tp2cp2pp2mb2sp1",
+ "status": "ok",
+ "total_time": 0.0206671
+}

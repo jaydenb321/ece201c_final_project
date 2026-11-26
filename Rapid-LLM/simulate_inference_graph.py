@@ -1,0 +1,370 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+LLM Inference Simulation - Extended Graph Generation for Prefill + Decode
+
+This module extends RAPID-LLM's LLM training simulation to support full inference
+workflows including both prefill and autoregressive decode phases.
+"""
+
+import os
+import shutil
+from typing import Any, Callable, Dict, List, Tuple, Optional
+from dataclasses import dataclass
+
+import llm_util
+from train_timing import LLMExecutionDispatcher
+
+@dataclass
+class InferenceConfig:
+    """Configuration for inference simulation parameters.
+
+    Decode steps re-derive all parallelism degrees from the fresh
+    ``TimeCalculationLLMInference`` instance, so this carrier holds only
+    the fields the decode driver actually reads.
+    """
+    batch_size: int
+    seq_len: int  # prefill sequence length
+    decode_len: int  # number of decode steps
+    hidden_dim: int
+    num_heads: int
+    kv_heads: int
+    intermediate_size: int
+    vocab_size: int
+    use_moe: bool
+    num_experts: int
+    top_k: int
+
+    # Decode sampling configuration
+    sample_every: int = 32  # Sample every N decode steps
+
+@dataclass
+class DecodeSample:
+    """Represents a sampled decode step with execution results."""
+    step_id: int
+    current_seq_len: int
+    execution_time: float
+    execution_energy: float
+    kv_cache_tokens: int
+
+
+class DecodeGraph:
+    """
+    Sampled decode-phase driver.
+
+    Handles step-by-step token generation with evolving sequence lengths and
+    KV-cache considerations. M7 note: this used to inherit the legacy
+    ``simulate_train_graph.Graph``, which served purely as an attribute
+    carrier for ``llm_util.process_decode_gemm_shapes`` — every attribute the
+    shared GEMM utilities read (``use_moe``/``moe_*``/attention geometry/
+    ``run_type``) is set directly in ``__init__`` now, and each sampled step
+    re-enters the Program-core dispatcher via ``prepare_decode_graphs``.
+    """
+
+    def __init__(
+        self,
+        config: InferenceConfig,
+        hw_config,
+        model_config,
+        time_calc_cls: Callable[..., Any],
+        output_dir: Optional[str] = None,
+    ):
+        self.config = config
+        self.hw_config = hw_config
+        self.model_config = model_config
+        self.time_calc_cls = time_calc_cls
+        self.output_dir = output_dir
+        self.mtp = getattr(getattr(model_config, "inference_config", None), "mtp", None)
+        self._decode_sample_root: Optional[str] = None
+        self.use_moe = config.use_moe
+        self.num_experts = config.num_experts
+        self.top_k = config.top_k
+        # Mirror MoE configuration expected by shared GEMM utilities
+        self.moe_num_experts = int(getattr(config, "num_experts", 1) or 1)
+        self.moe_top_k = int(getattr(config, "top_k", 1) or 1)
+        model_cfg = getattr(model_config, "model_config", None)
+        self.layer_mixers = getattr(model_cfg, "layer_mixers", (("attention",),))
+        self.moe_intermediate_size = int(
+            getattr(model_cfg, "moe_intermediate_size", getattr(config, "intermediate_size", 0))
+        )
+        self.n_shared_experts = int(getattr(model_cfg, "n_shared_experts", 0) or 0)
+        self.head_dim = getattr(model_cfg, "head_dim", None)
+        attention_cfg = getattr(model_cfg, "attention", None)
+        self.attention_type = getattr(attention_cfg, "attention_type", "mha")
+        self.kv_lora_rank = getattr(attention_cfg, "kv_lora_rank", None)
+        self.q_lora_rank = getattr(attention_cfg, "q_lora_rank", None)
+        self.qk_nope_head_dim = getattr(attention_cfg, "qk_nope_head_dim", None)
+        self.qk_rope_head_dim = getattr(attention_cfg, "qk_rope_head_dim", None)
+        self.v_head_dim = getattr(attention_cfg, "v_head_dim", None)
+        self.run_type = str(getattr(model_cfg, "run_type", "inference")).lower()
+
+    def build_decode_graph(self) -> Tuple[float, float, List[DecodeSample]]:
+        """
+        Build decode phase using sample-based approach for efficiency.
+
+        Instead of simulating every decode step, we sample at regular intervals
+        and integrate between sample points using linear interpolation.
+
+        Returns:
+            Tuple of (total_decode_time, total_decode_energy, decode_samples)
+        """
+        # Determine decode steps we actually simulate
+        sample_points = self._generate_sample_points()
+
+        # Execute graphs at sample points
+        decode_samples = []
+        for step_id in sample_points:
+            generated_tokens = step_id + 1
+            total_seq_len = self.config.seq_len + generated_tokens
+
+            guesses = self.mtp.guesses if self.mtp else 0
+            gemm_shapes = llm_util.process_decode_gemm_shapes(
+                self,
+                batch_size=self.config.batch_size,
+                current_seq_len=total_seq_len + guesses,
+                query_seq_len=guesses + 1,
+                d_model=self.config.hidden_dim,
+                num_heads=self.config.num_heads,
+                kv_heads=self.config.kv_heads,
+                intermediate_size=self.moe_intermediate_size if self.use_moe else self.config.intermediate_size,
+                vocab_size=self.config.vocab_size,
+                model_type=self.model_config.model_config.model_type,
+            )
+
+            sample_time, sample_energy = self._execute_decode_step(
+                step_id=step_id,
+                total_seq_len=total_seq_len,
+                gemm_shapes=gemm_shapes,
+            )
+
+            decode_samples.append(
+                DecodeSample(
+                    step_id=step_id,
+                    current_seq_len=total_seq_len,
+                    execution_time=sample_time,
+                    execution_energy=sample_energy,
+                    kv_cache_tokens=total_seq_len if any("attention" in k for k in self.layer_mixers) else 0,
+                )
+            )
+
+        total_decode_time, total_decode_energy = self._integrate_decode_samples(decode_samples)
+
+        return total_decode_time, total_decode_energy, decode_samples
+
+    def _generate_sample_points(self) -> List[int]:
+        """Generate decode step sample points based on sampling configuration."""
+        sample_points = []
+
+        # Always sample step 0 (first decode step)
+        sample_points.append(0)
+
+        # Sample at regular intervals
+        for step_id in range(self.config.sample_every - 1, self.config.decode_len, self.config.sample_every):
+            sample_points.append(step_id)
+
+        # Always sample the last step if configured
+        last_step = self.config.decode_len - 1
+        if last_step not in sample_points:
+            sample_points.append(last_step)
+
+        return sorted(sample_points)
+
+    def _execute_decode_step(
+        self,
+        *,
+        step_id: int,
+        total_seq_len: int,
+        gemm_shapes: Dict[str, Tuple[int, ...]],
+    ) -> Tuple[float, float]:
+        """Execute decode step using appropriate RAPID-LLM execution mode.
+
+        Returns ``(execution_time, execution_energy)``."""
+
+        if not self.hw_config or not self.model_config:
+            raise RuntimeError("Hardware config and model config are required for decode step execution.")
+        if not self.time_calc_cls:
+            raise RuntimeError("time_calc_cls must be provided for decode execution.")
+
+        temp_time_calc = self.time_calc_cls(
+            hw_config=self.hw_config,
+            model_config=self.model_config,
+            mode="LLM",
+            output_dir=self.output_dir,
+        )
+
+        base_dir = temp_time_calc.output_dir.rstrip(os.sep)
+        sample_dir = None
+        if self._debug_graphs_enabled():
+            sample_dir = os.path.join(base_dir, "decode_samples", f"step_{step_id:04d}")
+            root_dir = os.path.dirname(sample_dir)
+            if self._decode_sample_root is None:
+                self._decode_sample_root = root_dir
+                if os.path.isdir(root_dir):
+                    shutil.rmtree(root_dir, ignore_errors=True)
+            os.makedirs(sample_dir, exist_ok=True)
+            gemm_shapes_file = os.path.join(sample_dir, "decode_gemm_shapes.txt")
+            with open(gemm_shapes_file, "w", encoding="utf-8") as f:
+                for key, shape in gemm_shapes.items():
+                    f.write(f"{key}: {shape}\n")
+            prev_output_dir = temp_time_calc.output_dir
+            temp_time_calc.output_dir = sample_dir
+
+        guesses = self.mtp.guesses if self.mtp else 0
+        execution_graphs, energy = temp_time_calc.prepare_decode_graphs(
+            batch_size=self.config.batch_size,
+            total_seq_len=total_seq_len + guesses,
+            gemm_shapes=gemm_shapes,
+            **({"query_seq_len": guesses + 1} if guesses else {}),
+        )
+        workload, _ = execution_graphs
+
+        dispatcher = LLMExecutionDispatcher(temp_time_calc, workload)
+
+        result = dispatcher.run(temp_time_calc.execution_mode)
+        if sample_dir:
+            temp_time_calc.output_dir = prev_output_dir
+            print(
+                f"[decode] sample step {step_id}: seq_len={total_seq_len}, "
+                f"time={result.total_time:.4f}s, artifacts={sample_dir}"
+            )
+        else:
+            print(
+                f"[decode] sample step {step_id}: seq_len={total_seq_len}, "
+                f"time={result.total_time:.4f}s"
+            )
+        if guesses:
+            draft_time = temp_time_calc.mtp_draft_time(self.config.batch_size, total_seq_len)
+            round_time = draft_time + result.total_time
+            print(f"[mtp] draft={draft_time * 1e3:.4f} ms, "
+                  f"verify={result.total_time * 1e3:.4f} ms, "
+                  f"expected tokens/round={self.mtp.expected_tokens:.4f}")
+            # Decode samples feed the existing per-output-token interpolator.
+            return round_time / self.mtp.expected_tokens, energy / self.mtp.expected_tokens
+        return result.total_time, energy
+
+    def _integrate_decode_samples(self, samples: List[DecodeSample]) -> Tuple[float, float]:
+        """
+        Integrate execution times between sample points using linear interpolation.
+
+        Since attention cost grows linearly, we can use trapezoid rule integration
+        to get accurate total time from sparse samples. Returns
+        ``(total_time, total_energy)``.
+        """
+        if not samples:
+            raise ValueError("No decode samples available for integration")
+
+        total_time = 0.0
+        total_energy = 0.0
+
+        for idx, sample in enumerate(samples):
+            if idx == 0:
+                total_time += sample.execution_time
+                total_energy += sample.execution_energy
+                if self._debug_graphs_enabled():
+                    print(
+                        f"[decode] integration seed step {sample.step_id:02d}: "
+                        f"time={sample.execution_time:.4f}s, energy={sample.execution_energy:.4f}J"
+                    )
+                continue
+
+            prev_sample = samples[idx - 1]
+            step_gap = sample.step_id - prev_sample.step_id
+            if step_gap <= 0:
+                raise ValueError("Sample points must be strictly increasing")
+
+            midpoint = 0.5 * (prev_sample.execution_time + sample.execution_time)
+            segment_time = midpoint * step_gap
+            total_time += segment_time
+
+            midpoint_energy = 0.5 * (prev_sample.execution_energy + sample.execution_energy)
+            segment_energy = midpoint_energy * step_gap
+            total_energy += segment_energy
+
+            print(
+                f"[decode] integration segment {prev_sample.step_id}->{sample.step_id}: "
+                f"width={step_gap}, midpoint={midpoint:.4f}s, contribution={segment_time:.4f}s"
+            )
+
+        last_sample = samples[-1]
+        remaining_steps = self.config.decode_len - (last_sample.step_id + 1)
+        if remaining_steps > 0:
+            tail_time = remaining_steps * last_sample.execution_time
+            total_time += tail_time
+            total_energy += remaining_steps * last_sample.execution_energy
+            print(
+                f"[decode] integration tail from {last_sample.step_id} covering {remaining_steps} steps: "
+                f"contribution={tail_time:.4f}s"
+            )
+
+        print(
+            f"[decode] total interpolated decode time: {total_time:.4f}s, energy: {total_energy:.4f}J "
+            f"from {len(samples)} samples"
+        )
+
+        return total_time, total_energy
+
+    def _debug_graphs_enabled(self) -> bool:
+        flag = os.environ.get("RAPID_VISUALIZE_GRAPHS")
+        if flag is None:
+            return False
+        return flag.strip().lower() not in {"", "0", "false", "no"}
+
+
+
+class InferenceEngine:
+    """
+    Main orchestrator for complete LLM inference simulation.
+
+    Manages the transition from prefill to decode phases and coordinates
+    the overall inference execution using existing RAPID-LLM infrastructure.
+    """
+
+    def __init__(
+        self,
+        config: InferenceConfig,
+        hw_config=None,
+        model_config=None,
+        *,
+        time_calc_cls: Optional[Callable[..., Any]] = None,
+        output_dir: Optional[str] = None,
+    ):
+        self.config = config
+        self.hw_config = hw_config
+        self.model_config = model_config
+        self.decode_graph: Optional[DecodeGraph] = None
+        self.time_calc_cls = time_calc_cls
+        self.output_dir = output_dir
+
+
+    def _build_decode_graph(self) -> Tuple[float, float, List[DecodeSample]]:
+        """
+        Build decode phase using sample-based approach with proper RAPID-LLM integration.
+
+        Returns:
+            Tuple of (total_decode_time, total_decode_energy, decode_samples)
+        """
+        if self.time_calc_cls is None:
+            raise RuntimeError("InferenceEngine requires time_calc_cls for decode graph building.")
+
+        self.decode_graph = DecodeGraph(
+            config=self.config,
+            hw_config=self.hw_config,
+            model_config=self.model_config,
+            time_calc_cls=self.time_calc_cls,
+            output_dir=self.output_dir,
+        )
+
+        return self.decode_graph.build_decode_graph()

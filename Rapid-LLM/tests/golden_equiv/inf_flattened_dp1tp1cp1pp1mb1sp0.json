@@ -1,0 +1,115 @@
+{
+ "astra_times": {
+  "flat": {
+   "runs": [
+    {
+     "max_sec": 0.001942001,
+     "per_rank_sec": [
+      0.001942001,
+      0.001942001
+     ],
+     "sig": "758eb4dbe25f13cb00f50c2203020a60f6f1dc63b55cde69901d558f08b7e0cd"
+    },
+    {
+     "max_sec": 0.010553,
+     "per_rank_sec": [
+      0.010553,
+      0.010553
+     ],
+     "sig": "f4e4006c4fa5e2f05353d756cc0fcf09940c1599b111cfc5fffd12d120132858"
+    },
+    {
+     "max_sec": 0.001968001,
+     "per_rank_sec": [
+      0.001968001,
+      0.001968001
+     ],
+     "sig": "ff4c9bc6eeb7658792fcbc2e2a32fc8274032b9ff97d2175f7448575558ff38e"
+    }
+   ]
+  }
+ },
+ "bundles": {
+  "flat": {
+   "bundle_hash": "fc1c7caa66c2823491f2fe5f2c712e8d054e9e4e930cee1f9f50c23be230e391",
+   "byte_hist_by_kind": {},
+   "bytes_by_kind": {},
+   "collectives_by_group": {},
+   "comm_groups": {},
+   "compute_micros_total": 3936,
+   "manifest": {
+    "npus": 1,
+    "ranks": {
+     "0": {
+      "COMP:0": 1,
+      "COMP:132": 2,
+      "COMP:167": 2,
+      "COMP:320": 2,
+      "COMP:37": 4,
+      "COMP:458": 1,
+      "COMP:62": 2
+     }
+    },
+    "version": "df-astra-manifest/1"
+   },
+   "manifest_sha256": "06c5e8018f89b830048bc730208714a4b2b0013c888b560b59c0969ab092634e",
+   "n_ranks": 2,
+   "n_recv": 0,
+   "n_transfers": 0,
+   "ranks": {
+    "0": {
+     "bytes_by_kind": {},
+     "compute_micros": 1968,
+     "critical_path_nodes": 14,
+     "critical_path_weight": 1968,
+     "dag_hash": "2fd1fd8a922bb17a6a57d2e6dbcf9070a19c0b7b5169b58b2ca983d3aa0a1c77",
+     "n_nodes": 14,
+     "op_counts": {
+      "COMP": 14
+     },
+     "ops_hash": "ddf8f46e7f1952c167dc03fc1dc7759b14776b0948e42ae111550c3f531f25cf"
+    },
+    "1": {
+     "bytes_by_kind": {},
+     "compute_micros": 1968,
+     "critical_path_nodes": 14,
+     "critical_path_weight": 1968,
+     "dag_hash": "2fd1fd8a922bb17a6a57d2e6dbcf9070a19c0b7b5169b58b2ca983d3aa0a1c77",
+     "n_nodes": 14,
+     "op_counts": {
+      "COMP": 14
+     },
+     "ops_hash": "ddf8f46e7f1952c167dc03fc1dc7759b14776b0948e42ae111550c3f531f25cf"
+    }
+   }
+  }
+ },
+ "dlsim_ok": {
+  "flat": true
+ },
+ "error_tail": "",
+ "git_rev": "85e635b",
+ "memory": {
+  "LLM": {
+   "fields": {
+    "final_decode_peak_memory_usage_per_gpu": 0.89,
+    "hardware_memory_capacity_per_gpu": 80.0,
+    "max_peak_memory_usage_per_gpu": 0.97,
+    "prefill_peak_memory_usage_per_gpu": 0.97,
+    "remaining_memory_headroom": 79.03,
+    "simulation_mode": "inference"
+   },
+   "warnings": []
+  }
+ },
+ "p2p_ok": {
+  "flat": true
+ },
+ "phase_times": {
+  "decode": 0.125,
+  "prefill": 0.011
+ },
+ "spec_id": "inf:flattened:dp1tp1cp1pp1mb1sp0",
+ "status": "ok",
+ "total_time": 0.14
+}

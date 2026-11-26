@@ -1,0 +1,3205 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The mapping object — QIF P3 (plan `docs/qif/plans/P3_mapping.html`).
+
+Four relations and one annotation set (P3 §1). Everything else is derived.
+
+===========  ==========================  =====================================
+Relation     From -> to                  Where it lives here
+===========  ==========================  =====================================
+Residency    tile -> macro column set    :attr:`FwsMapping.tiles`, sited by
+                                         P2's ``enumerate_tiles`` (or by
+                                         ``cim.allocation`` when the user
+                                         wrote one)
+Assembly     macro -> chip               :attr:`FwsMapping.chips`; chip ids are
+                                         INTEGERS and capacity is a hard error
+Package      chip -> package graph       fully-connected p2p (D17); the drawn
+                                         edges are the boundary table
+Execution    op -> device                :class:`FwsDevice` + the placed DAG
+                                         (``program/fws_build.py``)
+Annotation   entity -> (tp, ep, pp)      :class:`ShardCoord`, with membership
+                                         CONSTRUCTED by
+                                         ``program.groups.CommunicatorFactory``
+===========  ==========================  =====================================
+
+Three stances bind the module.
+
+* **A3 — the macro is the atomic resource, the tile is the allocation unit.**
+  A macro's stored columns are claimed by column SETS (mux slots); a set holds
+  one tile. Unowned columns are legal and REPORTED (ADJ-5), never rounded away.
+* **ADJ-5 — a chip hosts many macros; chip = chiplet = package unit.** ``pp``
+  is an INDEPENDENT annotation: a chip index is not implicitly a pipeline
+  stage. The shared-chiplet count is a config input and the derived suggestion
+  is reported next to it. PD is two separate inventories.
+* **D21 — honesty invariants.** Chips are integers. Every macro names an owner
+  (a tile owner, or a reservation string). One accounting per metric: this
+  module never prices an op, and it never restates a number the law layer
+  (P2, ``cim_timing``) already owns.
+
+**P3 does not price.** The DAG this mapping feeds carries zero durations by
+construction — P4 owns pricing (A1, P4 §1). A boundary rate needs a time base
+and P3 has no timeline, so :meth:`FwsMapping.boundary_table` takes the period
+as a DECLARED input with a basis string, and reports bytes and required link
+time when no period is supplied. Nothing here invents a period.
+
+The `TileSite` row convention, pinned
+------------------------------------
+``cim_timing.TileSite.row_start``/``row_end`` had two producer conventions and
+no validation (the Wave A leftover). This module pins ONE and validates it:
+
+    **a site's row range is the half-open K range of the OWNER'S weight matrix
+    that the site holds** — exactly what ``enumerate_tiles`` emits, so
+    ``site.row_start == tile.k_start`` and ``site.row_end == tile.k_end``, and
+    the span never exceeds the card's rows.
+
+:func:`validate_tile_row_convention` enforces it on every tile this module
+places, so a producer that drifts fails a test rather than a drawing.
+``CimDeviceModel.allocation_sites`` is the other producer: it fills the range
+with ``(0, rows)`` because a `cim.allocation` entry DECLARES no K range at all.
+That output feeds the capacity check, which reads column sets only and never
+looks at rows — so this module never consumes it as a row range. A user
+allocation reaches a tile here through :func:`_apply_user_allocation`, which
+keeps the enumerator's rows and overrides only the site's macro and column
+sets.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+
+import cim_timing
+from cim_timing import (
+    ANALOG_CHIP_AREA_MM2,
+    CANONICAL_WALK,
+    CimDeviceModel,
+    DensePacking,
+    HOP_CROSS_CHIP,
+    HOP_INTRA_CHIP,
+    HOP_INTRA_MACRO,
+    LINK_PRICE_BASIS,
+    PackRequest,
+    T_HOP_CROSS_CHIP,
+    T_HOP_INTRA_CHIP,
+    Tile,
+    TileOwner,
+    TileSite,
+    analog_chip_capacity,
+    analog_chip_capacity_disclosures,
+    hop_kind,
+    link_price_disclosures,
+    refuse_dead_fold,
+    stage_handoff_time_s,
+)
+from program.groups import CommunicatorFactory, canonical_axis_label
+from program.ir import GroupKey
+from program.layout import RankLayout
+from program.placement import DeviceCoord
+
+
+class MappingError(ValueError):
+    """A mapping could not be built, or a declared mapping is inconsistent.
+
+    Carries the DSE's stage-tag convention (P3 exports, P6): the message opens
+    with ``[<stage>]`` so a downstream consumer can group failures by the
+    relation that refused — ``residency``, ``assembly``, ``package``,
+    ``execution`` or ``annotation``.
+    """
+
+    def __init__(self, stage: str, message: str) -> None:
+        self.stage = str(stage)
+        super().__init__(f"[{self.stage}] {message}")
+
+
+# ---------------------------------------------------------------------------
+# Device classes (A2) and the WIDENED device coordinate
+# ---------------------------------------------------------------------------
+
+#: The three device classes ops run on, plus the link a transfer rides. A2 and
+#: D12/D13 name them; P4's pricing table prices each one from a P2 law.
+DEVICE_CLASSES: Tuple[str, ...] = (
+    "analog_macro",      # weight GEMM only
+    "macro_pool",        # that macro's digital pool: reductions, acts, conv
+    "shared_digital",    # act x act, attention, scan / state update (D13)
+    "link",              # not a device: the p2p a transfer rides (D17)
+)
+
+DEVICE_CLASS_CODE: Mapping[str, int] = {
+    name: index for index, name in enumerate(DEVICE_CLASSES)
+}
+
+#: The axes a widened device coordinate carries. ``tp``/``ep``/``pp`` are the
+#: rewrite's own axes; ``dev_class`` and ``host_macro`` are the widening P3
+#: needs (P3 §4: "a device also has a class and a host macro. That is a wider
+#: coordinate, not a new IR").
+#:
+#: The widening is ADDITIVE BY CONSTRUCTION: ``program.placement.DeviceCoord``
+#: stores a free-form ``{axis: int}`` mapping, so a coordinate with extra axes
+#: is an ordinary DeviceCoord and the GPU rank grid — which never carries these
+#: axes — is untouched. Nothing in ``program/`` is edited to express this.
+FWS_DEVICE_AXES: Tuple[str, ...] = ("tp", "ep", "pp", "dev_class", "host_macro")
+
+#: Axes a mapping annotates (D20). ``cp`` is deliberately absent.
+MAPPING_AXES: Tuple[str, ...] = ("tp", "ep", "pp")
+
+#: The pinned meaning of ``TileSite.row_start``/``row_end`` (see module doc).
+TILE_ROW_CONVENTION = "owner_matrix_k_range"
+
+#: Stride used for chip-local macro ids while the slot count is still being
+#: derived; it only has to exceed any one chip's usage before the shift.
+_LOCAL_BASE_STRIDE = 1_000_000
+
+#: ADJ-6: decode steps the DAG lowers by default. A longer run is a window
+#: plus a DISCLOSED extrapolation, never a silent truncation.
+DEFAULT_DECODE_WINDOW = 2
+
+#: The two packing laws a mapping can be built under (P7.2).
+#:
+#: ``dedicated`` is what every shipped config gets and what P3 has always
+#: done: each weight matrix starts on a fresh macro, so a tensor that does not
+#: fill its last macro leaves the remainder idle.
+#:
+#: ``dense`` is INVARIANT W (D27): one contiguous bank stream across the
+#: chip's tensors, so a bank idles only when the stream runs out. It is opt-in
+#: at this seam and changes no shipped number until a caller asks for it.
+PACKING_DEDICATED = "dedicated"
+PACKING_DENSE = "dense"
+PACKING_MODES: Tuple[str, ...] = (PACKING_DEDICATED, PACKING_DENSE)
+
+#: The two SERVING REGIMES a mapped fws_cim run can be lowered under (D29).
+#:
+#: ``filled_pipeline`` is D29 and the default for every run that DECLARES a
+#: ``mapping:`` block: decode is independent streams staggered across the
+#: pipeline stages, ONE token exits per beat, the local batch is always 1
+#: (M = 1 on every analog op, attention and scan per stream), and the resident
+#: stream count D IS the stage count. Batch size does not exist in it.
+#:
+#: ``lockstep`` is the RETIRED D15 regime — one batch of same-length requests
+#: stepping through the whole model together — kept as a degenerate/testing
+#: mode. It is what the pass-1/2 closed form models, so the ADJ-8 bridge and
+#: every run that declares no ``mapping:`` block lower under it, and every such
+#: run carries the ``serving_regime`` disclosure that says so by name.
+REGIME_FILLED = "filled_pipeline"
+REGIME_LOCKSTEP = "lockstep"
+SERVING_REGIMES: Tuple[str, ...] = (REGIME_FILLED, REGIME_LOCKSTEP)
+
+#: The two LINK PRICING modes a mapped fws_cim run can be lowered under.
+#:
+#: ``priced`` is the machine: every inter-chip boundary handoff is charged the
+#: D17 p2p law (bytes / bandwidth + latency), the stage that sends it holds its
+#: slot until it lands, and the beat can be set by a link. It is the DEFAULT
+#: and no shipped number moves.
+#:
+#: ``zeroed`` is a TEMPORARY relaxation George asked for on 2026-08-27: the
+#: inter-chip handoffs are priced at 0 s so the run reads COMPUTE ONLY. The
+#: BYTES are untouched — they are a fact of the mapping and stay annotated and
+#: reported — and only the TIME is relaxed. Intra-chip movement is unaffected:
+#: it was already a dependency and not a priced link (D17). Every artifact of
+#: a zeroed run carries the ``links_zeroed`` disclosure, because a throughput
+#: read off a machine whose links are free is not this machine's throughput.
+#:
+#: EVERY inter-chip transfer means every one: the stage handoffs, the fabric
+#: and reduction hops that cross a chip, and the D16 PD pair handoff, which
+#: rides the same pp link under the same law (:func:`build_pd_pair`). What is
+#: NOT relaxed is the boundary TABLE: its ``required_time_s`` is what the
+#: DECLARED link needs for those bytes, a property of the card rather than a
+#: priced duration, and its congestion note says in its own words that the
+#: excess is REPORTED and NOT priced. Vacating it would delete the one warning
+#: that says what the relaxation is hiding.
+LINKS_PRICED = "priced"
+LINKS_ZEROED = "zeroed"
+LINK_MODES: Tuple[str, ...] = (LINKS_PRICED, LINKS_ZEROED)
+
+
+# ---------------------------------------------------------------------------
+# THE STUB ROUND'S LAW CONSTANTS (D38 and the platform interface)
+# ---------------------------------------------------------------------------
+#
+# THE LINK PRICES AND THE CHIP CAPACITY LIVE IN THE LAW LAYER. ``cim_timing``
+# declares T_HOP_INTRA_CHIP / T_HOP_CROSS_CHIP, the hop classifier, the flat
+# stage-handoff price and ``analog_chip_capacity`` (C = floor(400 mm2 / macro
+# footprint)); they are imported above and re-exported here so the mapper, the
+# pricer and the DAG builder read ONE spelling of each (D21: one law, one
+# place). Nothing about them is restated in this module.
+#
+# The stage handoff hop REPLACES `links: zeroed` as the default for a mapped
+# run: handoffs are priced at a platform latency instead of at 0 s, and a run
+# that still wants free links declares `mapping.links: zeroed` by name.
+
+#: KV AND RECURRENT STATE ARE FP8 (D38: "KV and recurrent state are FP8
+#: (8 bits/element) for now"). One byte per element, named once, so no site
+#: reads the tensor precision for a quantity D38 fixed.
+STATE_ELEMENT_BYTES: float = 1.0
+STATE_ELEMENT_DTYPE: str = "fp8"
+STATE_ELEMENT_BASIS: str = (
+    "D38: KV and recurrent state are FP8 — 8 bits, so STATE_ELEMENT_BYTES = 1.0 "
+    "byte per element. It is a PLATFORM choice for now and not the run's tensor "
+    "format: sw_param.precision keeps sizing activations and weights, and the "
+    "state store this mapping builds is sized at 1 B/element whatever the "
+    "activations are. Every artifact that carries a state or KV byte count "
+    "carries this disclosure by name."
+)
+
+#: THE STUB DISCLOSURE. Every artifact of a mapped run carries it BY NAME until
+#: the mapping law lands: what this round places is not a designed mapping.
+MAPPING_STUB_KEY: str = "mapping_stub"
+MAPPING_STUB_VALUE: str = (
+    "mapping = stub-v0 (pipeline-order dense packing, per-layer stages, "
+    "full K-stack)"
+)
+MAPPING_STUB_REASON: str = (
+    "THE MAPPING LAW HAS NOT LANDED. This run places weights by walking the "
+    "model in pipeline order and packing them densely into analog chips at the "
+    "chip's derived slot capacity, cutting a chip wherever the stream fills one "
+    "— ACROSS stage boundaries, so a layer may sit on two chips. The stages are "
+    "the finest granularity D38 admits (one layer per stage) and the K stack is "
+    "carried whole. No balance objective, no area objective and no search chose "
+    "any of it. RESULTS FROM THIS MAPPING ARE NOT DESIGN-VALID: they are what a "
+    "dense pipeline-order packing happens to reach, and they will move when the "
+    "mapping law lands. Results are NOT design-valid until the mapping law "
+    "lands."
+)
+
+#: THE PIPELINE FILL AXIS (D38). ``pp_util`` is the fraction of the stages that
+#: hold a resident stream: 1.0 is the full pipeline D29 always assumed, and the
+#: two underfilled values trade throughput (linear in the fill) against
+#: state/KV area (linear in the resident streams). It is DECLARED — the one
+#: mapping axis D38 leaves — and every underfilled run discloses it by name.
+PP_UTIL_FULL: float = 1.0
+PP_UTIL_VALUES: Tuple[float, ...] = (1.0, 0.75, 0.5)
+
+
+def resident_streams_of(stages: int, pp_util: float) -> int:
+    """D — resident streams = max(1, round(pp_util x stages)) (D38).
+
+    ONE spelling of the rounding, because D is what the state bill, the DAG's
+    rotation and the throughput all read. A mapping with no stage plan has no
+    resident streams and reports 0 (the retired lockstep regime).
+    """
+    count = int(stages)
+    if count <= 0:
+        return 0
+    return max(1, int(round(float(pp_util) * count)))
+
+
+def stream_entry_beat(traversal: int, stages: int, streams: int) -> int:
+    """The beat traversal ``j`` ENTERS the pipeline at (D29 + D38's fill).
+
+    A full pipeline admits one traversal per beat, which is what D29 always
+    lowered. An UNDERFILLED one admits a traversal only when a stream comes
+    free, so entries are spaced ``stages / D`` beats apart and the machine
+    holds exactly D streams instead of one per stage. The spacing is the ONLY
+    place the fill enters the machine: throughput, occupancy and the state bill
+    then all read it off the same timeline (D21).
+
+    Integer arithmetic, so the spacing never drifts: ``j x stages // D``. At
+    the full fill (D = stages) it is ``j``, which is the pre-D38 rotation
+    unchanged.
+    """
+    count = max(1, int(streams))
+    return (int(traversal) * int(stages)) // count
+
+
+def lowered_beats(stages: int, streams: int, steady: int) -> int:
+    """Beats the DAG lowers so ``steady`` STEADY inter-exit intervals exist.
+
+    ``steady + 2`` traversals have to COMPLETE: the last of them enters at
+    ``stream_entry_beat(steady + 1)`` and leaves ``stages`` beats later. Their
+    ``steady + 1`` inter-exit intervals are measured and the first is held out
+    as the fill transient, which leaves exactly ``steady``.
+    """
+    if int(stages) <= 0 or int(streams) <= 0:
+        return 0
+    return stream_entry_beat(int(steady) + 1, stages, streams) + int(stages)
+
+
+def check_pp_util(value: object, *, context: str) -> float:
+    """`mapping.pp_util` -> one of D38's fill fractions, or a named refusal."""
+    try:
+        fill = float(value)
+    except (TypeError, ValueError):
+        raise MappingError(
+            "execution",
+            f"{context} = {value!r} is not a fill fraction. D38 makes pp_util the "
+            f"pipeline's FILL, one of {PP_UTIL_VALUES}: resident streams = pp_util x "
+            "stages.",
+        )
+    for candidate in PP_UTIL_VALUES:
+        if abs(fill - candidate) <= 1e-12:
+            return float(candidate)
+    raise MappingError(
+        "execution",
+        f"{context} = {fill!r} is not one of D38's fill fractions {PP_UTIL_VALUES}. "
+        "D38: \"THE NEW AXIS: pp_util in {1.0, 0.75, 0.5} — a deliberately UNDERFILLED "
+        "pipeline (resident streams = pp_util x stages)\". The axis is a closed list, "
+        "not a continuum: a fill nobody adjudicated is a machine nobody priced.",
+    )
+
+
+@dataclass(frozen=True)
+class PipelineStage:
+    """One PP stage of the filled pipeline (D29): layers, chips, and its index.
+
+    A stage is the unit the rotation turns on: at every beat, stage ``index``
+    holds one stream and hands it to stage ``index + 1``. The stage COUNT is
+    the resident-stream count D — it is derived here and never configured as a
+    batch (D29: batch size does not exist).
+    """
+
+    index: int
+    layers: Tuple[int, ...]
+    chips: Tuple[int, ...]
+    label: str
+
+    def as_dict(self) -> "OrderedDict[str, object]":
+        return OrderedDict(
+            (
+                ("stage", int(self.index)),
+                ("label", self.label),
+                ("layers", list(self.layers)),
+                ("chips", list(self.chips)),
+            )
+        )
+
+
+def stage_partition(
+    num_layers: int,
+    layers_per_stage: Optional[object] = None,
+    chip_layers: Sequence[Tuple[int, ...]] = (),
+    pp_of_backbone_chip: Sequence[int] = (),
+    pp: int = 1,
+) -> Tuple[Tuple[int, ...], str]:
+    """The stage plan — DERIVED, one layer per stage (D38).
+
+    D38 retired the partition as an input: "layers_per_stage RETIRES as a sweep
+    axis. The machine is always maximally disaggregated: local microbatch 1,
+    finest motif-compatible stages, everything time-matched by area sizing...
+    Stage granularity DERIVES." So there is ONE source and no fourth: the layer
+    list itself, one layer per stage.
+
+    ``layers_per_stage`` survives only to be REFUSED BY NAME: a config that
+    still declares a partition is asking for a machine D38 removed, and a
+    silently ignored input is worse than a refusal. ``chip_layers``,
+    ``pp_of_backbone_chip`` and ``pp`` are accepted and unused — the chip
+    partition is where weights SIT, which after D38 no longer decides where a
+    stage BOUNDARY falls.
+
+    Returns the per-stage layer tuples and the basis string that names where
+    they came from, because a stage count is the resident-stream count's
+    denominator and a reader must be able to see it derive.
+    """
+    total = int(num_layers)
+    if layers_per_stage is not None:
+        raise MappingError(
+            "execution",
+            f"mapping.layers_per_stage = {layers_per_stage!r} is REFUSED BY NAME "
+            "(D38): \"layers_per_stage RETIRES as a sweep axis. The machine is always "
+            "maximally disaggregated: local microbatch 1, finest motif-compatible "
+            "stages, everything time-matched by area sizing... Stage granularity "
+            "DERIVES.\" The stage plan is one layer per stage and there is no input "
+            "that changes it; the fill fraction mapping.pp_util is the axis that "
+            "replaced it, and it changes the resident STREAMS, never the stages.",
+        )
+    if total <= 0:
+        raise MappingError(
+            "execution",
+            "a stage plan needs layers: the model declares num_layers = "
+            f"{total}, so there is nothing to stage (D38's finest granularity is one "
+            "layer per stage).",
+        )
+    stages = tuple((index,) for index in range(total))
+    basis = (
+        f"DERIVED (D38): one layer per stage, {total} stages — the finest "
+        "granularity, which is the only one D38 leaves. Nothing declared it."
+    )
+    return stages, basis
+
+
+@dataclass(frozen=True)
+class ShardCoord:
+    """One entity's (tp, ep, pp) coordinates — the annotation set of P3 §1."""
+
+    tp: int = 0
+    ep: int = 0
+    pp: int = 0
+
+    def as_dict(self) -> Dict[str, int]:
+        return {"tp": int(self.tp), "ep": int(self.ep), "pp": int(self.pp)}
+
+    def of(self, axis: str) -> int:
+        return int(self.as_dict()[axis])
+
+
+# ---------------------------------------------------------------------------
+# Weight-matrix inventory: the GEMM stages a layer puts on analog macros
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StageShape:
+    """One weight matrix a block contributes, before tp sharding.
+
+    ``shard_axis`` is the Megatron split: ``n`` is column-parallel (the output
+    dimension splits), ``k`` is row-parallel (the input dimension splits, and
+    the op's partial sums need a tp reduction), ``none`` is replicated.
+    """
+
+    op: str
+    k: int
+    n: int
+    shard_axis: str = "n"
+    expert: int = -1
+    routed: bool = False           # a routed-expert stage (leaves the layer chip when ep > 1)
+
+    def sharded(self, tp: int) -> "StageShape":
+        if tp <= 1 or self.shard_axis == "none":
+            return self
+        dim = self.n if self.shard_axis == "n" else self.k
+        if dim % tp != 0:
+            raise MappingError(
+                "residency",
+                f"tp = {tp} does not divide the {self.shard_axis.upper()} dimension "
+                f"{dim} of weight matrix {self.op!r} (K x N = {self.k} x {self.n}). "
+                "Set parallelism.tp (or mapping.parallelism.tp) to a divisor, or "
+                "change the model dimension that produced it.",
+            )
+        if self.shard_axis == "n":
+            return replace(self, n=dim // tp)
+        return replace(self, k=dim // tp)
+
+
+def _attention_stages(device: CimDeviceModel, model=None) -> Tuple[StageShape, ...]:
+    shapes = device.per_layer_stage_shapes()
+    stages = [
+        StageShape("qkv", *shapes["qkv"], shard_axis="n"),
+        StageShape("o_proj", *shapes["o_proj"], shard_axis="k"),
+    ]
+    attention = getattr(model, "attention", None) if model is not None else None
+    if attention is not None and bool(getattr(attention, "output_gate", False)):
+        # Gated attention (Qwen3.5). The output gate is an ORDINARY weight
+        # matrix: W_g maps the block input to one scalar per attention output
+        # channel, so its shape is (hidden, num_heads * head_dim) — exactly the
+        # extra `hidden_dim * q_size` term llm_util's attention census already
+        # counts for `output_gate`, read at (K, N) instead of as a scalar. It
+        # is COLUMN-parallel, which splits the query heads exactly the way the
+        # o_proj's row split does, so a tp shard holds the gate of the heads it
+        # owns and the multiply needs no extra reduction.
+        p = device.params
+        stages.insert(1, StageShape(
+            "attn_gate_proj", p.hidden_dim, p.num_heads * p.head_dim, shard_axis="n"
+        ))
+    return tuple(stages)
+
+
+def _ffn_stages(device: CimDeviceModel) -> Tuple[StageShape, ...]:
+    shapes = device.per_layer_stage_shapes()
+    return (
+        StageShape("ffn1", *shapes["ffn1"], shard_axis="n"),
+        StageShape("ffn2", *shapes["ffn2"], shard_axis="k"),
+    )
+
+
+def _moe_stages(device: CimDeviceModel) -> Tuple[StageShape, ...]:
+    """Router, routed experts and shared experts of one MoE layer.
+
+    The shapes are ``moe_layer_stage_arrays``' own, restated as (K, N) pairs
+    per expert instead of as an array total — the same accounting at a finer
+    grain, which is what a placement needs.
+    """
+    p = device.params
+    i_moe = p.moe_intermediate
+    stages: List[StageShape] = [
+        # The router is tiny and every tp shard needs the whole of it.
+        StageShape("router", p.hidden_dim, p.num_experts, shard_axis="none"),
+    ]
+    for expert in range(p.num_experts):
+        stages.append(
+            StageShape(
+                "ffn1_routed", p.hidden_dim, p.ffn1_fold * i_moe,
+                shard_axis="n", expert=expert, routed=True,
+            )
+        )
+        stages.append(
+            StageShape(
+                "ffn2_routed", i_moe, p.hidden_dim,
+                shard_axis="k", expert=expert, routed=True,
+            )
+        )
+    # The shared expert may be WIDER than a routed one (Granite-4.0-H-Tiny: 64
+    # routed experts at 512 beside one shared MLP at 1024). P2 owns that width.
+    i_shared = p.shared_expert_intermediate
+    for expert in range(p.n_shared_experts):
+        stages.append(
+            StageShape(
+                "ffn1_shared", p.hidden_dim, p.ffn1_fold * i_shared,
+                shard_axis="n", expert=expert,
+            )
+        )
+        stages.append(
+            StageShape(
+                "ffn2_shared", i_shared, p.hidden_dim,
+                shard_axis="k", expert=expert,
+            )
+        )
+    return tuple(stages)
+
+
+def _hybrid_stages(model, block_kind: str) -> Tuple[StageShape, ...]:
+    """Weight MATRICES of one hybrid mixer block (P1 schema, D1).
+
+    These are exactly the matrix terms of ``llm_util``'s raw-parameter census
+    for the same block — one accounting of the weights, read at (K, N) instead
+    of as a scalar total. The census's remaining terms are NOT matrices and so
+    are not tiles: the depthwise conv kernels run on the per-macro pool (ADJ-3)
+    and the ``A_log`` / ``D`` / ``dt_bias`` vectors are pool state.
+    """
+    hidden = int(model.hidden_dim)
+    if block_kind == "ssm":
+        ssm = model.ssm
+        if ssm is None:
+            raise MappingError(
+                "residency",
+                "model_param.layer_plan names an 'ssm' block but model_param.ssm "
+                "is absent; the mapper cannot invent the mixer dimensions.",
+            )
+        d_inner = int(ssm.resolve_d_inner(hidden))
+        if str(ssm.variant).lower() == "mamba2":
+            in_n = 2 * d_inner + 2 * int(ssm.n_groups) * int(ssm.d_state) + int(ssm.n_heads)
+            return (
+                StageShape("ssm_in_proj", hidden, in_n, shard_axis="n"),
+                StageShape("ssm_out_proj", d_inner, hidden, shard_axis="k"),
+            )
+        dt_rank = int(ssm.dt_rank)
+        return (
+            StageShape("ssm_in_proj", hidden, 2 * d_inner, shard_axis="n"),
+            StageShape(
+                "ssm_x_proj", d_inner, dt_rank + 2 * int(ssm.d_state), shard_axis="none"
+            ),
+            StageShape("ssm_dt_proj", dt_rank, d_inner, shard_axis="n"),
+            StageShape("ssm_out_proj", d_inner, hidden, shard_axis="k"),
+        )
+    if block_kind == "linear_attn":
+        la = model.linear_attention
+        if la is None:
+            raise MappingError(
+                "residency",
+                "model_param.layer_plan names a 'linear_attn' block but "
+                "model_param.linear_attention is absent.",
+            )
+        key_dim = int(la.key_dim)
+        value_dim = int(la.value_dim)
+        qkv_out = 2 * key_dim + value_dim + (value_dim if bool(la.output_gate) else 0)
+        gate_out = int(la.num_value_heads) * (2 if bool(la.decay_gate) else 1)
+        return (
+            StageShape("la_qkv_proj", hidden, qkv_out, shard_axis="n"),
+            StageShape("la_gate_proj", hidden, gate_out, shard_axis="none"),
+            StageShape("la_out_proj", value_dim, hidden, shard_axis="k"),
+        )
+    if block_kind == "short_conv":
+        conv = model.short_conv
+        if conv is None:
+            raise MappingError(
+                "residency",
+                "model_param.layer_plan names a 'short_conv' block but "
+                "model_param.short_conv is absent.",
+            )
+        conv_dim = int(conv.conv_dim)
+        return (
+            StageShape(
+                "conv_in_proj", hidden, int(conv.in_proj_streams) * conv_dim, shard_axis="n"
+            ),
+            StageShape("conv_out_proj", conv_dim, hidden, shard_axis="k"),
+        )
+    raise MappingError("residency", f"unknown mixer block kind {block_kind!r}")
+
+
+# ---------------------------------------------------------------------------
+# Placement records
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MacroSlot:
+    """One enumerated macro slot: the atomic resource, with its named owners."""
+
+    macro_id: int
+    chip_id: int
+    slot: int                       # index within the chip
+    pool: str                       # "analog" | "digital"
+    card_id: str
+    shard: ShardCoord
+    tiles: Tuple[Tile, ...] = ()
+    reserved: Optional[str] = None
+    analog_device: int = -1
+    pool_device: int = -1
+
+    @property
+    def owners(self) -> Tuple[TileOwner, ...]:
+        seen: "OrderedDict[TileOwner, None]" = OrderedDict()
+        for tile in self.tiles:
+            seen.setdefault(tile.owner, None)
+        return tuple(seen)
+
+    @property
+    def held_columns(self) -> int:
+        """Stored columns tiles actually hold (their LOGICAL widths)."""
+        return sum(tile.logical_columns for tile in self.tiles)
+
+    @property
+    def claimed_column_sets(self) -> int:
+        return sum(tile.site.num_column_sets for tile in self.tiles)
+
+
+@dataclass(frozen=True)
+class ChipRecord:
+    """One chip = one chiplet = one package unit (ADJ-5). The id is an INTEGER."""
+
+    chip_id: int
+    label: str
+    pool: str                       # "analog" | "digital"
+    shard: ShardCoord
+    macro_slots: int
+    macro_ids: Tuple[int, ...] = ()
+    layers: Tuple[int, ...] = ()    # layers resident on this chip (analog only)
+    role: str = "backbone"          # "backbone" | "expert_pool" | "shared_digital"
+
+
+@dataclass(frozen=True)
+class FwsDevice:
+    """One device in the inventory (A2). ``device_id`` is the IR's DeviceId."""
+
+    device_id: int
+    device_class: str
+    chip_id: int
+    macro_id: int                   # -1 when the device is not macro-hosted
+    shard: ShardCoord
+    role_key: Tuple[int, int, str]  # (chip index within shard, slot, class)
+
+    @property
+    def coord(self) -> DeviceCoord:
+        """The WIDENED device coordinate: shard axes + class + host macro.
+
+        ``host_macro`` is present only on a macro-hosted device; asking a
+        shared digital chiplet for its host macro raises ``PlacementError``
+        naming the axis, which is the honest answer rather than a sentinel.
+        """
+        coords = dict(self.shard.as_dict())
+        coords["dev_class"] = DEVICE_CLASS_CODE[self.device_class]
+        if self.macro_id >= 0:
+            coords["host_macro"] = int(self.macro_id)
+        return DeviceCoord(coords)
+
+
+@dataclass(frozen=True)
+class BoundaryRow:
+    """One boundary of the P3.5 table: bytes, rate, and a NAMED verdict.
+
+    A violated boundary is REPORTED, not priced (D17): with no congestion
+    model there is nothing to charge it to, so the DAG time stays optimistic
+    and :attr:`disclosure` says exactly that.
+
+    The verdict is ``required_time_s > period_s`` — the p2p law's own answer,
+    latency included. ``ratio`` is the separate bytes-rate comparison
+    (``required_rate / available_rate``) and can sit below 1 on a violated row
+    when the link's LATENCY is what does not fit. Two numbers, two questions;
+    neither is derived from the other.
+    """
+
+    boundary_id: str
+    role: str                       # tp | ep | pp | pd | act
+    src_chip: int
+    dst_chip: int
+    bytes_per_unit: float
+    unit: str                       # "prefill" | "decode_step"
+    label: str
+    basis: str
+    bandwidth_bytes_per_s: float
+    latency_s: float
+    required_time_s: float
+    crosses_link: bool = True
+    period_s: Optional[float] = None
+    required_rate_bytes_per_s: Optional[float] = None
+    available_rate_bytes_per_s: float = 0.0
+    ratio: Optional[float] = None
+    violated: bool = False
+    disclosure: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Relaxation:
+    """A disclosed relaxation (D21): it renders as a banner, never a footnote."""
+
+    constraint: str
+    value: str
+    reason: str
+
+
+# ---------------------------------------------------------------------------
+# The mapping object
+# ---------------------------------------------------------------------------
+
+
+class FwsMapping:
+    """The placement of one system: tiles, macros, chips, devices, groups.
+
+    Construct with :func:`build_mapping`. The object is a plain record with
+    derived views; it computes no time and prices no op.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: CimDeviceModel,
+        hw_config,
+        model_config,
+        system_id: str,
+        role: str,
+        phase: str,
+        label: str,
+        model_id: str,
+        degrees: Mapping[str, int],
+        chips: Sequence[ChipRecord],
+        macros: Sequence[MacroSlot],
+        devices: Sequence[FwsDevice],
+        tiles: Sequence[Tile],
+        blocks: Sequence[str],
+        endpoint_blocks: Sequence[str],
+        layer_chip: Mapping[int, Tuple[int, ...]],
+        shared_chiplet_suggestion: int,
+        decode_window: int,
+        notes: Sequence[str],
+        relaxations: Sequence[Relaxation],
+        packing: str = PACKING_DEDICATED,
+        packings: Mapping[int, DensePacking] = (),
+        links: str = LINKS_PRICED,
+        regime: str = REGIME_LOCKSTEP,
+        stages: Sequence[PipelineStage] = (),
+        stage_basis: str = "",
+        pp_util: float = PP_UTIL_FULL,
+        chip_capacity: int = 0,
+        tail_slots: int = 0,
+    ) -> None:
+        self.device = device
+        self.hw = hw_config
+        self.model = model_config
+        self.system_id = system_id
+        self.role = role
+        self.phase = phase
+        self.label = label
+        self.model_id = model_id
+        self.degrees = dict(degrees)
+        self.chips = tuple(chips)
+        self.macros = tuple(macros)
+        self.devices = tuple(devices)
+        self.tiles = tuple(tiles)
+        self.blocks = tuple(blocks)
+        self.endpoint_blocks = tuple(endpoint_blocks)
+        self.layer_chip = {int(k): tuple(v) for k, v in layer_chip.items()}
+        self.shared_chiplet_suggestion = int(shared_chiplet_suggestion)
+        self.decode_window = int(decode_window)
+        self.notes = tuple(notes)
+        self._relaxations = tuple(relaxations)
+        #: P7.2: which packing law placed these tiles, and the per-chip
+        #: packings when it was the dense one. "dedicated" leaves ``packings``
+        #: empty, which is what every shipped config still gets.
+        self.packing = str(packing)
+        self.packings = OrderedDict(
+            (int(chip_id), value) for chip_id, value in dict(packings).items()
+        )
+        #: P7.7 / D29: the SERVING REGIME this mapping is lowered under, the
+        #: stage plan the rotation turns on, and where the plan came from.
+        #: ``resident_streams`` (D) is DERIVED from the stage count — it is
+        #: never a configured batch, which under D29 does not exist.
+        self.regime = str(regime)
+        self.stages = tuple(stages)
+        self.stage_basis = str(stage_basis)
+        #: D38's fill fraction: the share of the stages that hold a resident
+        #: stream. 1.0 is D29's always-full pipeline and the default; 0.75 and
+        #: 0.5 are the priced, disclosed underfills. It is the ONE mapping axis
+        #: D38 leaves, and it moves D — never the stage plan.
+        self.pp_util = float(pp_util)
+        #: The analog chip's derived slot capacity C = floor(400 mm2 / macro
+        #: footprint) and the ONE tail the pipeline-order packer leaves in the
+        #: last chip of each stream. 0 when the stub packer did not run.
+        self.chip_capacity = int(chip_capacity)
+        self.tail_slots = int(tail_slots)
+        #: WHICH LINK PRICING MODE this mapping is lowered under. ``priced`` is
+        #: the machine (D17 p2p on every inter-chip boundary); ``zeroed`` is
+        #: the TEMPORARY relaxation that charges those handoffs 0 s and
+        #: discloses it by name. The mapper spells the mode; the pricer
+        #: applies it (D21: one law, one place).
+        self.links = str(links)
+
+        sizes = {axis: max(1, int(self.degrees[axis])) for axis in MAPPING_AXES}
+        strides: Dict[str, int] = {}
+        span = 1
+        for axis in MAPPING_AXES:
+            strides[axis] = span
+            span *= sizes[axis]
+        self._shard_layout = RankLayout(
+            axis_order=MAPPING_AXES, axis_sizes=sizes, axis_strides=strides
+        )
+        self._communicators = CommunicatorFactory(self._shard_layout)
+        self._chip_by_id = {chip.chip_id: chip for chip in self.chips}
+        self._macro_by_id = {macro.macro_id: macro for macro in self.macros}
+        self._device_by_id = {dev.device_id: dev for dev in self.devices}
+        self._device_by_role = {
+            (self.shard_id(dev.shard), dev.role_key): dev.device_id for dev in self.devices
+        }
+        self._tiles_by_owner: "OrderedDict[TileOwner, List[Tile]]" = OrderedDict()
+        for tile in self.tiles:
+            self._tiles_by_owner.setdefault(tile.owner, []).append(tile)
+        self._macro_of_tile = {}
+        for macro in self.macros:
+            for tile in macro.tiles:
+                self._macro_of_tile[id(tile)] = macro.macro_id
+
+    # -- the filled pipeline (D29): stages, D, and the layer -> stage map ---
+
+    @property
+    def resident_streams(self) -> int:
+        """D — the resident stream count: ``round(pp_util x stages)`` (D38).
+
+        Derived, never declared. At the default fill (pp_util = 1.0) it is D29
+        exactly: one stream per stage, one token out per beat. Under an
+        UNDERFILLED pipeline it is the smaller resident count D38 prices —
+        state and KV scale with it (linear in the streams) and throughput
+        scales with the fill (linear in the streams over the stages), which is
+        the whole trade. A mapping with no stage plan (the retired lockstep
+        regime) has no resident streams and reports 0 rather than 1, so the two
+        regimes can never be read off one field as if they were the same
+        machine.
+        """
+        return resident_streams_of(len(self.stages), self.pp_util)
+
+    @property
+    def pipeline_fill(self) -> float:
+        """D / stages — what the resident streams actually fill (D38).
+
+        The REALIZED fill, not the declared one: D is an integer count of
+        streams, so a 0.75 fill of 10 stages is 8 streams and the realized fill
+        is 0.8. Every number that scales with the fill scales with THIS.
+        """
+        stages = len(self.stages)
+        if stages <= 0:
+            return 0.0
+        return float(self.resident_streams) / float(stages)
+
+    def stage_of_layer(self, layer: int) -> int:
+        for stage in self.stages:
+            if int(layer) in stage.layers:
+                return stage.index
+        raise MappingError(
+            "execution",
+            f"layer {layer} is on no pipeline stage: the stage plan is a partition of "
+            "the layers and this one covers none of it (D29).",
+        )
+
+    # -- the shard grid: membership CONSTRUCTED, never inferred (P3.3) ----
+
+    @property
+    def shard_layout(self) -> RankLayout:  # noqa: D401 - see the cache below
+        """The (tp, ep, pp) grid the annotations live in.
+
+        This is a ``RankLayout`` in the rewrite's own sense, and the ids it
+        linearizes are SHARD ids — the coordinate space, not the device space.
+        A device is then found by (shard id, role); membership is therefore
+        built from (axis, coords) exactly as ``program/groups.py`` requires,
+        and never from a participant count.
+        """
+        return self._shard_layout
+
+    @property
+    def communicators(self) -> CommunicatorFactory:
+        """The ONE factory (its memo is why it is built once, not per call)."""
+        return self._communicators
+
+    def shard_id(self, shard: ShardCoord) -> int:
+        return int(self.shard_layout.linearize(shard.as_dict()))
+
+    def shard_of_id(self, shard_id: int) -> ShardCoord:
+        coords = self.shard_layout.coords_of(int(shard_id))
+        return ShardCoord(**{axis: int(coords[axis]) for axis in MAPPING_AXES})
+
+    @property
+    def primary_group(self) -> str:
+        """The axis whose index colors this mapping (ADJ-7).
+
+        The first axis of ``tp, ep, pp`` with a degree above 1; ``tp`` when the
+        machine has no parallelism at all. The rule is a property of the FILE,
+        not of what is on screen, so a filter never repaints anything.
+        """
+        for axis in MAPPING_AXES:
+            if int(self.degrees.get(axis, 1)) > 1:
+                return axis
+        return "tp"
+
+    def device_group(self, axis: str, device_id: int) -> GroupKey:
+        """The communicator a device belongs to on ``axis`` (P3.3).
+
+        Members are the devices playing the SAME ROLE in the sibling shards
+        that ``CommunicatorFactory.members`` enumerates for the anchor's
+        coordinates. Nothing is re-derived downstream: this key is what the
+        DAG registers and what P4 reads.
+        """
+        if axis not in MAPPING_AXES:
+            raise MappingError("annotation", f"{axis!r} is not one of {MAPPING_AXES}")
+        dev = self._device_by_id[int(device_id)]
+        anchor = self.shard_id(dev.shard)
+        members = []
+        for sibling in self.communicators.members((axis,), anchor):
+            peer = self._device_by_role.get((int(sibling), dev.role_key))
+            if peer is not None:
+                members.append(int(peer))
+        return GroupKey(axis=canonical_axis_label((axis,)), members=tuple(sorted(members)))
+
+    # -- lookups ----------------------------------------------------------
+
+    def chip(self, chip_id: int) -> ChipRecord:
+        return self._chip_by_id[int(chip_id)]
+
+    def macro(self, macro_id: int) -> MacroSlot:
+        return self._macro_by_id[int(macro_id)]
+
+    def device_record(self, device_id: int) -> FwsDevice:
+        return self._device_by_id[int(device_id)]
+
+    def macro_of_tile(self, tile: Tile) -> int:
+        return int(self._macro_of_tile[id(tile)])
+
+    def tiles_for(self, owner: TileOwner) -> Tuple[Tile, ...]:
+        return tuple(self._tiles_by_owner.get(owner, ()))
+
+    def owners(self) -> Tuple[TileOwner, ...]:
+        return tuple(self._tiles_by_owner)
+
+    def analog_chips(self) -> Tuple[ChipRecord, ...]:
+        return tuple(chip for chip in self.chips if chip.pool == "analog")
+
+    def digital_chips(self) -> Tuple[ChipRecord, ...]:
+        return tuple(chip for chip in self.chips if chip.pool == "digital")
+
+    def devices_of_class(self, device_class: str) -> Tuple[FwsDevice, ...]:
+        return tuple(dev for dev in self.devices if dev.device_class == device_class)
+
+    def shared_digital_devices(self, shard: Optional[ShardCoord] = None) -> Tuple[FwsDevice, ...]:
+        devs = self.devices_of_class("shared_digital")
+        if shard is None:
+            return devs
+        same = tuple(dev for dev in devs if dev.shard.tp == shard.tp)
+        return same or devs
+
+    # -- who serves whom ---------------------------------------------------
+
+    def chiplet_index_of_chip(self, chip_id: int, shard=None) -> int:
+        """Which shared digital chiplet serves this analog chip.
+
+        THE ONE DEFINITION (D21). The lowering asks it to place an op and the
+        engine derivations ask it to size a chiplet for the stages it carries;
+        before this existed the two answered differently — the lowering dealt
+        chips round-robin (chip_id % chiplets) while the sizing dealt them in
+        contiguous blocks — so an engine was widened for a grouping the machine
+        did not build.
+
+        CONTIGUOUS is the answer both use, because it is the one the design
+        wants: a chiplet serves NEIGHBOURING pipeline stages, so the
+        activations it reads come from the analog chips beside it instead of
+        from across the package. Round-robin maximised the distance instead.
+        """
+        engines = self.shared_digital_devices(shard)
+        count = len(engines)
+        if count <= 0:
+            return 0
+        analog = [chip.chip_id for chip in self.chips if chip.pool == "analog"]
+        try:
+            position = analog.index(int(chip_id))
+        except ValueError:
+            position = int(chip_id)
+        total = len(analog) or 1
+        if count >= total:
+            return min(position, count - 1)
+        per = math.ceil(total / count)
+        return min(count - 1, position // per)
+
+    def chiplet_groups(self) -> Tuple[Tuple[int, ...], ...]:
+        """The analog chips each shared digital chiplet serves, in order.
+
+        The inverse of :meth:`chiplet_index_of_chip`, and taken FROM it rather
+        than re-derived, so the grouping the engines are sized for is the
+        grouping the DAG builds. A chiplet that serves nothing still gets a row
+        (an empty tuple): the machine builds it, so the sizing has to see it.
+        """
+        engines = self.shared_digital_devices()
+        count = len(engines)
+        if count <= 0:
+            return ()
+        groups: List[List[int]] = [[] for _ in range(count)]
+        for chip in self.chips:
+            if chip.pool != "analog":
+                continue
+            groups[self.chiplet_index_of_chip(chip.chip_id)].append(int(chip.chip_id))
+        return tuple(tuple(group) for group in groups)
+
+    # -- derived reports --------------------------------------------------
+
+    def macro_occupancy(self, macro_id: int) -> float:
+        macro = self.macro(macro_id)
+        stored = self._stored_columns(macro)
+        if stored <= 0:
+            return 0.0
+        return macro.held_columns / stored
+
+    def chip_occupancy(self, chip_id: int) -> float:
+        chip = self.chip(chip_id)
+        if chip.macro_slots <= 0:
+            return 0.0
+        used = sum(1 for mid in chip.macro_ids if self.macro(mid).tiles)
+        return used / chip.macro_slots
+
+    def _stored_columns(self, macro: MacroSlot) -> int:
+        if macro.pool == "digital":
+            return int(self.device.digital_card.fabric.cols)
+        card = self.device.card
+        return int(card.stored_columns_per_set) * int(card.column_sets_per_macro)
+
+    def unowned_macro_slots(self) -> int:
+        """Enumerated macro slots holding no tile. Legal, and reported (ADJ-5)."""
+        return sum(1 for macro in self.macros if macro.pool == "analog" and not macro.tiles)
+
+    def unowned_columns(self) -> int:
+        """Stored analog columns no tile holds — the granularity that is paid for.
+
+        Counts BOTH kinds of gap: a macro slot nothing claims, and the columns
+        of a claimed column set that the tile's logical width does not reach.
+        A mux slot is the smallest allocatable unit (ADJ-4), so the second kind
+        cannot be handed to another owner; it is unowned all the same, and
+        rounding it away would be the AUDIT finding-1 sin at column scale.
+        """
+        total = 0
+        for macro in self.macros:
+            if macro.pool != "analog":
+                continue
+            total += self._stored_columns(macro) - macro.held_columns
+        return int(total)
+
+    def packing_summary(self) -> "OrderedDict[str, object]":
+        """The Invariant W accounting for the WHOLE system (P7.2, D27).
+
+        The per-chip packings are streams; this is their sum, plus the two
+        numbers only the system level can state:
+
+          * ``cell_floor_macros`` — the GLOBAL cell floor,
+            ``ceil(total_model_cells / cells_per_macro)``. Analog silicon is
+            determined by the model, not chosen by the mapper (D27), and this
+            is that quantity.
+          * ``dedicated_macros`` / ``macros_saved`` — what the SAME tensors
+            reach under today's per-tensor placement, and the difference. The
+            delta is computed and disclosed here rather than left implicit
+            (P7.2 item 3): ``macros_saved == 0`` is the degenerate identity.
+
+        Returns an empty mapping under the dedicated packing: a summary of a
+        packing that was never run would be an invented number.
+        """
+        if not self.packings:
+            return OrderedDict()
+        device = self.device
+        card = device.card
+        cells_per_macro = (
+            int(card.params.rows)
+            * int(card.stored_columns_per_set)
+            * int(card.column_sets_per_macro)
+        )
+        packings = tuple(self.packings.values())
+        real = sum(p.real_cells for p in packings)
+        block = sum(p.block_cells for p in packings)
+        committed = sum(p.committed_cells for p in packings)
+        macros = sum(p.macro_count for p in packings)
+        dedicated = sum(self._dedicated_macros(chip_id) for chip_id in self.packings)
+        waste = committed - real
+        return OrderedDict(
+            (
+                ("packing", self.packing),
+                ("walk", packings[0].walk),
+                ("chips_packed", len(packings)),
+                ("macros", int(macros)),
+                ("dedicated_macros", int(dedicated)),
+                ("macros_saved", int(dedicated - macros)),
+                ("cell_floor_macros", int(-(-real // cells_per_macro)) if real else 0),
+                ("banks_used", sum(p.banks_used for p in packings)),
+                ("real_cells", int(real)),
+                ("committed_cells", int(committed)),
+                ("remainder_cells", int(block - real)),
+                ("tail_cells", int(committed - block)),
+                ("waste_cells", int(waste)),
+                ("waste_pct", (100.0 * waste / committed) if committed else 0.0),
+                ("k_stacks", sum(len(p.k_stacks) for p in packings)),
+                ("local_k_stacks", sum(len(p.local_k_stacks) for p in packings)),
+                ("spread_k_stacks", sum(len(p.spread_k_stacks) for p in packings)),
+                (
+                    "local_k_segments",
+                    sum(len(p.local_k_segments) for p in packings),
+                ),
+                # THE STUB PACKER'S CHIP ARITHMETIC, reported once: the derived
+                # slot capacity every analog chip is built to, and the ONE tail
+                # the pipeline-order stream leaves in the last chip it fills.
+                # 0/0 when the stream was cut per chip instead (the pre-stub
+                # per-chip dense packing).
+                ("chip_capacity_slots", int(self.chip_capacity)),
+                ("tail_slots", int(self.tail_slots)),
+            )
+        )
+
+    def _dedicated_macros(self, chip_id: int) -> int:
+        """Macros this chip's tensors reach under the PER-TENSOR placement.
+
+        The comparison term for the delta: ``tile_macro_count`` is exactly the
+        reach ``build_mapping`` advances its cursor by, so summing it over the
+        chip's owners reproduces the dedicated placement's macro count without
+        building it.
+        """
+        packing = self.packings[int(chip_id)]
+        device = self.device
+        seen: "OrderedDict[TileOwner, Tuple[int, int]]" = OrderedDict()
+        for tile in packing.tiles:
+            k, n = seen.get(tile.owner, (0, 0))
+            seen[tile.owner] = (max(k, tile.k_end), max(n, tile.n_end))
+        return sum(
+            device.tile_macro_count(
+                k, n, column_sets_per_tile=packing.column_sets_per_bank
+            )
+            for k, n in seen.values()
+        )
+
+    def summary(self) -> Dict[str, object]:
+        analog = self.analog_chips()
+        return OrderedDict(
+            (
+                ("system", self.system_id),
+                ("role", self.role),
+                ("phase", self.phase),
+                ("parallelism", dict(self.degrees)),
+                ("primary_group", self.primary_group),
+                ("analog_chips", len(analog)),
+                ("shared_digital_chiplets", len(self.digital_chips())),
+                ("shared_digital_suggestion", self.shared_chiplet_suggestion),
+                ("macro_slots", sum(chip.macro_slots for chip in self.chips)),
+                ("analog_macro_slots", sum(chip.macro_slots for chip in analog)),
+                ("macros_holding_tiles", sum(1 for m in self.macros if m.tiles)),
+                ("unowned_macro_slots", self.unowned_macro_slots()),
+                ("unowned_columns", self.unowned_columns()),
+                ("tiles", len(self.tiles)),
+                ("devices", len(self.devices)),
+                ("owners", len(self._tiles_by_owner)),
+                ("decode_window", self.decode_window),
+                # D29: the regime is the machine. Two mappings of one model
+                # that differ only by this word are two different machines,
+                # so it rides the summary beside the parallelism degrees.
+                ("serving_regime", self.regime),
+                ("pipeline_stages", len(self.stages)),
+                ("resident_streams", self.resident_streams),
+                # D38: the declared fill and the one the integer stream count
+                # realizes. Two mappings that differ only by this pair are two
+                # different machines, so both ride the summary.
+                ("pp_util", float(self.pp_util)),
+                ("pipeline_fill", float(self.pipeline_fill)),
+                ("stage_plan_basis", self.stage_basis),
+                ("layers_per_stage", [len(stage.layers) for stage in self.stages]),
+                # P7.3: the placement LAW these numbers came out of. Two
+                # mappings of one model can differ only by this word, so a
+                # summary that omitted it would make them look identical.
+                ("packing", self.packing),
+            )
+        )
+
+    def relaxations(self, boundary_rows: Sequence[BoundaryRow] = ()) -> Tuple[Relaxation, ...]:
+        """Every relaxation this mapping carries, disclosed (D21, AUDIT 5)."""
+        out = list(self._relaxations)
+        if any(row.violated for row in boundary_rows):
+            names = ", ".join(row.boundary_id for row in boundary_rows if row.violated)
+            out.append(
+                Relaxation(
+                    constraint="boundary_bandwidth",
+                    value=f"violated and NOT priced: {names}",
+                    reason=(
+                        "D17 fixes the network at fully-connected p2p with no congestion "
+                        "model, so a boundary whose required rate exceeds the declared "
+                        "link rate is REPORTED, not charged. Every DAG time that crosses "
+                        "one of these boundaries is optimistic by an amount this model "
+                        "cannot compute."
+                    ),
+                )
+            )
+        return tuple(out)
+
+    # -- the boundary table (P3.5) ---------------------------------------
+
+    def boundary_table(
+        self,
+        *,
+        period_s: Optional[float] = None,
+        period_basis: str = "",
+        tokens: Optional[int] = None,
+    ) -> Tuple[BoundaryRow, ...]:
+        """Per-boundary bytes and rates against the DECLARED link bandwidth.
+
+        ``period_s`` is the time base a RATE needs. P3 has no timeline (A1: the
+        DAG is P4's to price), so the period is an INPUT with a stated
+        ``period_basis``; without one the rows still carry bytes and the link
+        time they require, and every rate field stays ``None`` rather than
+        being invented.
+        """
+        if period_s is not None and not period_basis:
+            raise MappingError(
+                "package",
+                "boundary_table(period_s=...) needs period_basis: a rate whose time "
+                "base is unnamed is a number nobody can check (D21).",
+            )
+        dev = self.device
+        precision = self.hw.sw_config.precision
+        act_bytes = float(precision.activations)
+        layout = self.hw.network_layout
+        batch = int(dev.params.batch_size)
+        seq_len = int(dev.params.seq_len)
+        decode_len = int(getattr(self.model, "decode_len", 0) or 0)
+        prefill_len = max(0, seq_len - decode_len)
+        if tokens is None:
+            tokens = batch * prefill_len if self.phase == "prefill" else batch
+        unit = "prefill" if self.phase == "prefill" else "decode_step"
+        rows: List[BoundaryRow] = []
+
+        # 1. chip-boundary activations, one row per consecutive chip pair
+        #    inside a shard (act, ADJ-5: a chip boundary is never called pp).
+        pp_bw, pp_lat = layout.link_for_parallelism("pp")
+        boundary_bytes = dev.boundary_bytes(tokens, act_bytes)
+        for shard_chips in self._backbone_chips_by_tp_shard().values():
+            for src, dst in zip(shard_chips, shard_chips[1:]):
+                rows.append(
+                    self._row(
+                        boundary_id=f"act.c{src.chip_id}->c{dst.chip_id}",
+                        role="act",
+                        src=src.chip_id,
+                        dst=dst.chip_id,
+                        size=boundary_bytes,
+                        unit=unit,
+                        label="activation handoff across the chip boundary",
+                        basis=(
+                            f"cim_timing.boundary_bytes(tokens = {tokens}, act_bytes = "
+                            f"{act_bytes}) = tokens x hidden {dev.params.hidden_dim} x act"
+                        ),
+                        bw=pp_bw,
+                        lat=pp_lat,
+                        period_s=period_s,
+                    )
+                )
+
+        # 2. tp collectives: the row-parallel stages (o_proj, ffn2) leave
+        #    partial sums that a tp all-reduce sums.
+        tp = int(self.degrees.get("tp", 1))
+        if tp > 1:
+            tp_bw, tp_lat = layout.link_for_parallelism("tp")
+            payload = float(tokens) * float(dev.params.hidden_dim) * act_bytes
+            ring = 2.0 * (tp - 1) / tp
+            for shard_chips in self._backbone_chips_by_tp_shard().values():
+                for chip in shard_chips:
+                    peers = self._tp_siblings(chip)
+                    if not peers:
+                        continue
+                    reductions = 2 * len(chip.layers)  # o_proj and ffn2 per layer
+                    size = payload * ring * reductions
+                    rows.append(
+                        self._row(
+                            boundary_id=f"tp.c{chip.chip_id}",
+                            role="tp",
+                            src=chip.chip_id,
+                            dst=peers[0].chip_id,
+                            size=size,
+                            unit=unit,
+                            label=f"tp all-reduce of {reductions} row-parallel stages",
+                            basis=(
+                                f"ring all-reduce volume per link 2(tp-1)/tp = {ring:.6g} x "
+                                f"payload {payload:.6g} B x {reductions} row-parallel stages "
+                                "(o_proj and ffn2 of every resident layer). D17 fixes the "
+                                "fabric at fully-connected p2p, so this is the collective's "
+                                "declared per-link volume and not a topology claim."
+                            ),
+                            bw=tp_bw,
+                            lat=tp_lat,
+                            period_s=period_s,
+                        )
+                    )
+
+        # 3. expert dispatch and combine (ep), only when the experts left the
+        #    layer chip. With ep = 1 the routed experts sit on the layer chip
+        #    and there is NO boundary — which the report says out loud.
+        ep = int(self.degrees.get("ep", 1))
+        if ep > 1 and dev.params.use_moe:
+            ep_bw, ep_lat = layout.link_for_parallelism("ep")
+            dispatch = dev.moe_dispatch_bytes(tokens, act_bytes)
+            for chip in self.analog_chips():
+                if chip.role != "expert_pool":
+                    continue
+                source = self._layer_chip_for_expert_chip(chip)
+                if source is None:
+                    continue
+                for direction in ("dispatch", "combine"):
+                    rows.append(
+                        self._row(
+                            boundary_id=f"ep.{direction}.c{source}->c{chip.chip_id}",
+                            role="ep",
+                            src=source if direction == "dispatch" else chip.chip_id,
+                            dst=chip.chip_id if direction == "dispatch" else source,
+                            size=dispatch / ep,
+                            unit=unit,
+                            label=f"MoE expert {direction}",
+                            basis=(
+                                f"cim_timing.moe_dispatch_bytes(tokens = {tokens}) = tokens x "
+                                f"top_k {dev.params.top_k} x hidden {dev.params.hidden_dim} x "
+                                f"act, spread over ep = {ep} expert chips"
+                            ),
+                            bw=ep_bw,
+                            lat=ep_lat,
+                            period_s=period_s,
+                        )
+                    )
+
+        # 4. KV traffic. It crosses no p2p link in either KV story (cim_sram
+        #    is the chip's own activation SRAM; cim_dram is a per-chip DRAM
+        #    tier), so it is checked against the KV TIER's declared bandwidth
+        #    and marked as not crossing a link. One accounting, named.
+        kv_rows = self._kv_rows(unit=unit, period_s=period_s)
+        rows.extend(kv_rows)
+        return tuple(rows)
+
+    def _kv_rows(self, *, unit: str, period_s: Optional[float]) -> Tuple[BoundaryRow, ...]:
+        dev = self.device
+        inference = getattr(self.hw, "inference_config", None)
+        story = str(getattr(inference, "kvcache_type", "hbm_only") or "hbm_only").lower()
+        if story not in ("cim_sram", "cim_dram") or dev.params.is_vit_shaped:
+            return ()
+        precision = self.hw.sw_config.precision
+        kv_precision = float(precision.kv_cache)
+        tech_dram = self.hw.tech_config.DRAM
+        bandwidth = dev.kv_story_bandwidth(story, float(getattr(tech_dram, "bandwidth", 0.0) or 0.0))
+        seq_len = int(dev.params.seq_len)
+        decode_len = int(getattr(self.model, "decode_len", 0) or 0)
+        # Prefill WRITES the KV of the tokens it consumes; a decode step READS
+        # the whole context. Same law, two operating points — and the label
+        # says which one, because they are not the same number.
+        context = max(1, seq_len - decode_len) if self.phase == "prefill" else seq_len
+        traffic = "write" if self.phase == "prefill" else "read"
+        tp = max(1, int(self.degrees.get("tp", 1)))
+        rows = []
+        for chip in self.analog_chips():
+            if chip.role != "backbone" or not chip.layers:
+                continue
+            per_layer = dev.kv_read_bytes(context, kv_precision, dev.params.batch_size, tp)
+            size = per_layer * len(chip.layers)
+            rows.append(
+                self._row(
+                    boundary_id=f"kv.c{chip.chip_id}",
+                    role="act",
+                    src=chip.chip_id,
+                    dst=chip.chip_id,
+                    size=size,
+                    unit=unit,
+                    label=f"KV {traffic} traffic of {len(chip.layers)} resident layers",
+                    basis=(
+                        f"cim_timing.kv_read_bytes(context = {context}, tp = {tp}) x "
+                        f"{len(chip.layers)} resident layers, against the {story} tier's "
+                        "declared bandwidth. KV crosses no p2p link in either KV story."
+                    ),
+                    bw=bandwidth,
+                    lat=0.0,
+                    period_s=period_s,
+                    crosses_link=False,
+                )
+            )
+        return tuple(rows)
+
+    def _row(
+        self,
+        *,
+        boundary_id: str,
+        role: str,
+        src: int,
+        dst: int,
+        size: float,
+        unit: str,
+        label: str,
+        basis: str,
+        bw: float,
+        lat: float,
+        period_s: Optional[float],
+        crosses_link: bool = True,
+    ) -> BoundaryRow:
+        required_time = CimDeviceModel.p2p_time_s(size, bw, lat)
+        required_rate = None
+        ratio = None
+        violated = False
+        disclosure = None
+        if period_s is not None and period_s > 0:
+            required_rate = float(size) / float(period_s)
+            ratio = required_rate / bw if bw > 0 else float("inf")
+            violated = required_time > period_s
+            if violated:
+                disclosure = (
+                    f"boundary {boundary_id} needs {required_rate:.6g} B/s but the "
+                    f"declared link carries {bw:.6g} B/s (ratio {ratio:.4g}); the p2p law "
+                    f"needs {required_time:.6g} s against a period of {period_s:.6g} s, "
+                    "latency included. D17 gives this model no congestion term, so the "
+                    "excess is REPORTED and NOT priced: the DAG time is optimistic here."
+                )
+        return BoundaryRow(
+            boundary_id=boundary_id,
+            role=role,
+            src_chip=int(src),
+            dst_chip=int(dst),
+            bytes_per_unit=float(size),
+            unit=unit,
+            label=label,
+            basis=basis,
+            bandwidth_bytes_per_s=float(bw),
+            latency_s=float(lat),
+            required_time_s=float(required_time),
+            crosses_link=bool(crosses_link),
+            period_s=period_s,
+            required_rate_bytes_per_s=required_rate,
+            available_rate_bytes_per_s=float(bw),
+            ratio=ratio,
+            violated=violated,
+            disclosure=disclosure,
+        )
+
+    def _backbone_chips_by_tp_shard(self) -> "OrderedDict[int, Tuple[ChipRecord, ...]]":
+        """Backbone chips of each tp shard, in chip order — the chip CHAIN.
+
+        Keyed by the tp index and not by the whole shard id on purpose: pp
+        annotates that chain, it does not cut it (ADJ-5). Grouping by the full
+        coordinate would hide the boundary between two pp stages, which is the
+        one boundary a pipeline most needs drawn.
+        """
+        by_shard: "OrderedDict[int, List[ChipRecord]]" = OrderedDict()
+        for chip in self.analog_chips():
+            if chip.role != "backbone":
+                continue
+            by_shard.setdefault(int(chip.shard.tp), []).append(chip)
+        return OrderedDict((k, tuple(v)) for k, v in by_shard.items())
+
+    def _tp_siblings(self, chip: ChipRecord) -> Tuple[ChipRecord, ...]:
+        groups = self._backbone_chips_by_tp_shard()
+        position = [c.chip_id for c in groups[int(chip.shard.tp)]].index(chip.chip_id)
+        out = []
+        for sibling in self.communicators.members(("tp",), self.shard_id(chip.shard)):
+            tp_index = self.shard_of_id(int(sibling)).tp
+            if tp_index == chip.shard.tp:
+                continue
+            peers = groups.get(int(tp_index))
+            if peers and position < len(peers):
+                out.append(peers[position])
+        return tuple(out)
+
+    def _layer_chip_for_expert_chip(self, chip: ChipRecord) -> Optional[int]:
+        if not chip.layers:
+            return None
+        layer = chip.layers[0]
+        for candidate in self.analog_chips():
+            if candidate.role == "backbone" and layer in candidate.layers:
+                if candidate.shard.tp == chip.shard.tp:
+                    return candidate.chip_id
+        return None
+
+    # -- the text report --------------------------------------------------
+
+    def report(self, boundary_rows: Sequence[BoundaryRow] = ()) -> str:
+        """The mapping as text: placement, occupancy, boundaries, disclosures."""
+        summary = self.summary()
+        lines = [
+            f"[FWS-CIM] mapping '{self.label}' (P3): {summary['analog_chips']} analog chips, "
+            f"{summary['shared_digital_chiplets']} shared digital chiplets, "
+            f"{summary['tiles']} tiles on {summary['macros_holding_tiles']} of "
+            f"{summary['analog_macro_slots']} analog macro slots",
+            f"[FWS-CIM]   parallelism tp/ep/pp = "
+            f"{self.degrees['tp']}/{self.degrees['ep']}/{self.degrees['pp']}; "
+            f"primary group axis = {self.primary_group} (ADJ-7)",
+            f"[FWS-CIM]   unowned: {summary['unowned_macro_slots']} macro slots, "
+            f"{summary['unowned_columns']} stored columns "
+            "(legal and reported, ADJ-5)",
+            f"[FWS-CIM]   shared digital chiplets: declared "
+            f"{summary['shared_digital_chiplets']}, derived suggestion "
+            f"{self.shared_chiplet_suggestion} (ADJ-5: the count is a config input; "
+            "the suggestion is one chiplet per analog chip, which is the concurrency "
+            "the closed-form spatial pipeline assumes)",
+        ]
+        packing = self.packing_summary()
+        if packing:
+            # Invariant W is a REPORTED metric (D27), so it gets its own line
+            # rather than living only in a relaxation banner.
+            lines.append(
+                f"[FWS-CIM]   packing: {packing['packing']} ({packing['walk']} walk) — "
+                f"{packing['macros']} macros vs {packing['dedicated_macros']} dedicated "
+                f"({packing['macros_saved']} saved), global cell floor "
+                f"{packing['cell_floor_macros']}; waste {packing['waste_pct']:.3f}% "
+                f"= remainder {packing['remainder_cells']} + tail {packing['tail_cells']} "
+                f"cells; K stacks {packing['local_k_stacks']} in-macro / "
+                f"{packing['spread_k_stacks']} spread"
+            )
+        for note in self.notes:
+            lines.append(f"[FWS-CIM]   note: {note}")
+        for chip in self.analog_chips():
+            lines.append(
+                f"[FWS-CIM]   chip {chip.chip_id} ({chip.role}, tp{chip.shard.tp}/"
+                f"ep{chip.shard.ep}/pp{chip.shard.pp}): layers {list(chip.layers)}, "
+                f"{sum(1 for m in chip.macro_ids if self.macro(m).tiles)}/{chip.macro_slots} "
+                f"slots owned, occupancy {self.chip_occupancy(chip.chip_id):.3f}"
+            )
+        for row in boundary_rows:
+            verdict = "VIOLATED" if row.violated else "ok"
+            where = "p2p link" if row.crosses_link else "on-chip tier (crosses no link)"
+            lines.append(
+                f"[FWS-CIM]   boundary {row.boundary_id} ({row.role}): "
+                f"{row.bytes_per_unit:.6g} B per {row.unit}, needs "
+                f"{row.required_time_s * 1e6:.6f} us on a "
+                f"{row.bandwidth_bytes_per_s:.6g} B/s {where} -> {verdict}"
+            )
+            if row.disclosure:
+                lines.append(f"[FWS-CIM]   [NOTE] {row.disclosure}")
+        for relaxation in self.relaxations(boundary_rows):
+            lines.append(
+                f"[FWS-CIM]   [RELAXATION] {relaxation.constraint} = {relaxation.value}: "
+                f"{relaxation.reason}"
+            )
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+
+def validate_tile_row_convention(tiles: Sequence[Tile], rows: int) -> None:
+    """Pin and check the ``TileSite`` row convention (the Wave A leftover).
+
+    A site's row range is the half-open K range of the owner's weight matrix
+    it holds. Anything else — a physical row extent, a 0-based placeholder, a
+    range wider than the card's rows — is refused by name here rather than
+    silently drawn later.
+    """
+    for tile in tiles:
+        site = tile.site
+        if site.row_start != tile.k_start or site.row_end != tile.k_end:
+            raise MappingError(
+                "residency",
+                f"tile {tile.owner.label} on macro {site.macro_id} declares site rows "
+                f"[{site.row_start}, {site.row_end}) but the tile holds matrix rows "
+                f"[{tile.k_start}, {tile.k_end}). The pinned convention is "
+                f"{TILE_ROW_CONVENTION!r}: a site's row range IS the owner matrix's "
+                "K range.",
+            )
+        if not (0 <= site.row_start < site.row_end):
+            raise MappingError(
+                "residency",
+                f"tile {tile.owner.label} on macro {site.macro_id} has an empty or "
+                f"negative row range [{site.row_start}, {site.row_end}).",
+            )
+        if site.row_end - site.row_start > int(rows):
+            raise MappingError(
+                "residency",
+                f"tile {tile.owner.label} on macro {site.macro_id} spans "
+                f"{site.row_end - site.row_start} rows but the card stores {rows}.",
+            )
+
+
+# ---------------------------------------------------------------------------
+# The builder: (workload, platform) -> mapping
+# ---------------------------------------------------------------------------
+
+
+def _shard_shapes(device: CimDeviceModel, model, layer_idx: int, tp: int) -> Tuple[StageShape, ...]:
+    """Weight matrices layer ``layer_idx`` puts on analog macros, tp-sharded."""
+    mixers = tuple(getattr(model, "layer_mixers", ())) or (("attention",),)
+    kinds = mixers[layer_idx] if layer_idx < len(mixers) else mixers[-1]
+    stages: List[StageShape] = []
+    for kind in kinds:
+        if kind == "attention":
+            stages.extend(_attention_stages(device, model))
+        elif kind in ("ffn", "moe"):
+            pass  # handled by the FFN half below
+        else:
+            stages.extend(_hybrid_stages(model, kind))
+    # THE FFN HALF IS NOT UNCONDITIONAL. `layer_plan.ffn_per_layer: false` says
+    # this stack's mixer layers carry no MLP at all — a pure Mamba-1 stack is
+    # the case it exists for — and a standalone "ffn"/"moe" layer in the pattern
+    # asks for one by name instead. Adding it to every layer regardless placed a
+    # phantom FFN on each of Falcon-Mamba's 64 layers, which roughly DOUBLED
+    # that model's weight footprint and priced GEMMs the pricing side (which
+    # does honour the flag) never counts.
+    wants_ffn = bool(getattr(model, "ffn_per_layer", True)) or any(
+        kind in ("ffn", "moe") for kind in kinds
+    )
+    if wants_ffn:
+        if device.layer_class_mask()[layer_idx]:
+            stages.extend(_moe_stages(device))
+        else:
+            stages.extend(_ffn_stages(device))
+    return tuple(stage.sharded(tp) for stage in stages)
+
+
+def _stub_requests(
+    device: CimDeviceModel,
+    model,
+    model_id: str,
+    degrees: Mapping[str, int],
+    tp_idx: int,
+    tp: int,
+) -> Tuple[PackRequest, ...]:
+    """One tp shard's weights, IN PIPELINE ORDER — the stub packer's stream.
+
+    The order is the model's own: layer 0's matrices, then layer 1's, to the
+    end. The packer never reorders it (D27), so the stream is the pipeline and
+    cutting it at the chip's capacity is exactly "fill chips in pipeline order,
+    across stage boundaries".
+
+    Endpoints are not in it: D30 drops embedding and lm_head entirely on the
+    mapped path, and a filled-pipeline mapping refuses a model that still
+    declares them.
+    """
+    shard = ShardCoord(tp=int(tp_idx), ep=0, pp=0)
+    shard_index = int(_linearize(degrees, shard))
+    out: List[PackRequest] = []
+    for layer in range(int(device.params.num_layers)):
+        for stage in _shard_shapes(device, model, layer, tp):
+            owner = TileOwner(model_id, layer, stage.op, stage.expert, shard_index)
+            out.append(
+                PackRequest(
+                    owner=owner,
+                    k=stage.k,
+                    n=stage.n,
+                    group=f"{model_id}.L{layer}",
+                )
+            )
+    return tuple(out)
+
+
+def _endpoint_shapes(device: CimDeviceModel, tp: int) -> Tuple[Tuple[str, StageShape], ...]:
+    """(position, stage) for the model-shaped endpoints; position is head/tail."""
+    p = device.params
+    out: List[Tuple[str, StageShape]] = []
+    if p.is_vit_shaped:
+        if p.patch_dim > 0:
+            out.append(("head", StageShape("patch_embed", p.patch_dim, p.hidden_dim, "n")))
+        if p.num_classes > 0:
+            out.append(("tail", StageShape("vit_head", p.hidden_dim, p.num_classes, "k")))
+    elif p.lm_head_enabled:
+        out.append(("tail", StageShape("lm_head", p.hidden_dim, p.vocab_size, "n")))
+    return tuple((where, stage.sharded(tp)) for where, stage in out)
+
+
+def _apply_user_allocation(
+    tiles: Sequence[Tile], entries: Sequence[object], owner_label: str
+) -> Tuple[Tile, ...]:
+    """Override the enumerator's SITE with the user's `cim.allocation` entries.
+
+    The config declares a macro and a set of mux slots per tile; it declares no
+    K range, so the enumerator's rows (the pinned convention) are kept and only
+    the site's macro and column sets move. Entries for one owner are consumed
+    in declaration order against the enumerator's block order — the only rule
+    that makes a row/column-partitioned matrix expressible at all — and a count
+    mismatch is refused by name.
+    """
+    if len(entries) != len(tiles):
+        raise MappingError(
+            "residency",
+            f"cim.allocation names {len(entries)} placement(s) for {owner_label} but "
+            f"the matrix tiles into {len(tiles)}. Entries for one owner are consumed in "
+            "declaration order against the enumerator's block order, so the counts must "
+            "match exactly.",
+        )
+    placed = []
+    for index, (tile, entry) in enumerate(zip(tiles, entries)):
+        declared_slice = getattr(entry, "slice_index", None)
+        if declared_slice is not None and int(declared_slice) != int(tile.slice_index):
+            # A DECLARED slice is a claim about which tile this entry places, and
+            # declaration order is what actually decides. When the two disagree
+            # the user's intent is unknowable, so it is refused rather than
+            # silently overruled (the field used to be parsed and dropped).
+            raise MappingError(
+                "residency",
+                f"cim.allocation entry {index} for {owner_label} declares "
+                f"slice_index = {int(declared_slice)} but declaration order places it on "
+                f"slice {int(tile.slice_index)}. Entries for one owner are consumed in "
+                "declaration order against the enumerator's block order; reorder the "
+                "entries or drop slice_index, which is unconstrained when absent.",
+            )
+        placed.append(
+            replace(
+                tile,
+                site=TileSite(
+                    macro_id=int(entry.macro),
+                    row_start=tile.k_start,
+                    row_end=tile.k_end,
+                    column_sets=tuple(entry.column_sets),
+                ),
+            )
+        )
+    return tuple(placed)
+
+
+def build_mapping(
+    hw_config,
+    model_config,
+    *,
+    spec=None,
+    system_id: str = "sys.fws",
+    role: str = "unified",
+    phase: Optional[str] = None,
+    label: Optional[str] = None,
+    model_id: Optional[str] = None,
+    packing: Optional[str] = None,
+    regime: Optional[str] = None,
+    links: Optional[str] = None,
+    pp_util: Optional[float] = None,
+) -> FwsMapping:
+    """``(workload, platform) -> mapping`` — the seam P3 fixes now.
+
+    ``spec`` is a ``config.MappingSystemConfig``; ``None`` takes the hardware
+    config's ``mapping:`` block, and an ABSENT block derives the DEDICATED
+    mapping, which reproduces today's ``cim.chip.layers_per_chip`` placement.
+    Config-declared allocation is the first implementation of this signature;
+    the ``layers_per_chip: auto`` packer is the second; automatic search is a
+    later third (D10). The workload argument is a single model today and the
+    signature takes a platform, never a count.
+
+    ``packing`` selects the placement law (P7.2): ``"dedicated"`` is today's
+    per-tensor placement and the DEFAULT, so no shipped number moves; ``"dense"``
+    is Invariant W (D27) — one contiguous bank stream per chip, so a bank idles
+    only when the stream runs out.
+
+    ``None`` (P7.3) reads it from the spec's ``mapping.packing`` field, which is
+    where a run DECLARES its placement law; an explicit keyword overrides the
+    config for a caller that wants both laws out of one machine (the packing
+    comparison is exactly that caller). One law reaches the packer either way.
+
+    ``links`` selects the LINK PRICING MODE by the same one sentence:
+    ``"priced"`` is the machine and the DEFAULT, ``"zeroed"`` is the TEMPORARY
+    relaxation that charges every inter-chip boundary handoff 0 s and rides a
+    ``links_zeroed`` disclosure into every artifact. ``None`` reads
+    ``mapping.links``.
+    """
+    import config as _config
+
+    model = getattr(model_config, "model_config", model_config)
+    device = CimDeviceModel(hw_config, model)
+    mapping_config = getattr(hw_config, "mapping_config", None)
+    # A run DECLARES a mapping when its HARDWARE CONFIG carries a `mapping:`
+    # block — config.py's own definition of a MAPPED fws_cim run, and the seam
+    # D29 keys off: a mapped run is a FILLED PIPELINE, and a run whose config
+    # declares no mapping is the retired lockstep comparison mode that holds
+    # the ADJ-8 bridge and the pass-1/2 closed form. A spec handed in by a
+    # caller (a PD half, a sweep candidate, an atlas emitter) does not by
+    # itself declare a regime: it can name one in `spec.regime`, and the
+    # `regime=` keyword overrides everything.
+    declared_mapping = mapping_config is not None
+    if spec is None:
+        spec = (
+            mapping_config.system
+            if mapping_config is not None
+            else _config.MappingSystemConfig()
+        )
+    p = device.params
+    decode_len = int(getattr(model, "decode_len", 0) or 0)
+    if phase is None:
+        phase = "decode" if decode_len > 0 else "prefill"
+    if phase not in ("prefill", "decode"):
+        raise MappingError("execution", f"phase must be 'prefill' or 'decode' (got {phase!r})")
+    # The config declares the law; an explicit keyword overrides it. There is
+    # no third source and no precedence rule beyond that one sentence (D21).
+    packing = str(getattr(spec, "packing", PACKING_DEDICATED) if packing is None else packing)
+    if packing not in PACKING_MODES:
+        raise MappingError(
+            "residency",
+            f"packing = {packing!r} is not a placement law this mapper has. The modes "
+            f"are {PACKING_MODES}: 'dedicated' places each weight matrix on fresh "
+            "macros, 'dense' packs one contiguous bank stream (Invariant W, D27).",
+        )
+    dense = packing == PACKING_DENSE
+    # --- the LINK PRICING MODE (TEMPORARY relaxation, George 2026-08-27) ---
+    # Same one sentence as the packing law: the config declares it, an explicit
+    # keyword overrides it, and there is no third source (D21).
+    links = str(getattr(spec, "links", LINKS_PRICED) if links is None else links)
+    if links not in LINK_MODES:
+        raise MappingError(
+            "package",
+            f"links = {links!r} is not a link pricing mode this mapper has. The modes "
+            f"are {LINK_MODES}: '{LINKS_PRICED}' charges every inter-chip boundary the "
+            f"D17 p2p law (the machine), '{LINKS_ZEROED}' is the TEMPORARY relaxation "
+            "that prices those handoffs at 0 s and discloses it by name. The BYTES are "
+            "reported under both.",
+        )
+    # --- the SERVING REGIME (D29) ----------------------------------------
+    declared_regime = regime if regime is not None else getattr(spec, "regime", None)
+    if declared_regime is None:
+        regime = REGIME_FILLED if (declared_mapping and phase == "decode") else REGIME_LOCKSTEP
+    else:
+        regime = str(declared_regime)
+    if regime not in SERVING_REGIMES:
+        raise MappingError(
+            "execution",
+            f"serving regime {regime!r} is not a regime this mapper lowers. The regimes "
+            f"are {SERVING_REGIMES}: '{REGIME_FILLED}' is D29 (staggered streams, one "
+            f"token out per beat, local batch 1) and '{REGIME_LOCKSTEP}' is the RETIRED "
+            "D15 batched-synchronous mode kept for the closed-form bridge.",
+        )
+    if regime == REGIME_FILLED and phase != "decode":
+        raise MappingError(
+            "execution",
+            f"mapping.regime = {REGIME_FILLED!r} on a {phase!r} mapping. The filled "
+            "pipeline is a DECODE regime (D25: prefill is out of P7; D29 stages "
+            "STREAMS, and a prefill has no stream to stagger). Lower the prefill half "
+            f"under {REGIME_LOCKSTEP!r}, or drop the regime and let the phase choose.",
+        )
+    if regime == REGIME_FILLED and int(getattr(p, "batch_size", 1) or 1) != 1:
+        # D29: THE LOCAL BATCH IS ALWAYS 1 and batch size does not exist as a
+        # concept. The refusal names the field, because a run that quietly
+        # forced M = 1 would publish a throughput for a machine the user did
+        # not ask for.
+        raise MappingError(
+            "execution",
+            "model_param.global_batch_size / gradient_accumulation_steps declare a "
+            f"local batch of {int(p.batch_size)}, and D29 removes batch size from the "
+            "fws_cim serving surface entirely: the pipeline is ALWAYS FULL, decode is "
+            "independent streams staggered across the pipeline stages, every analog op "
+            "fires at M = 1 and attention/scan are per stream. Throughput comes from "
+            "the resident stream count D (= the stage count, DERIVED), never from a "
+            "batch. Set model_param.global_batch_size: 1, or lower this run under the "
+            f"retired {REGIME_LOCKSTEP!r} regime, which is what the pass-1/2 closed "
+            "form models.",
+        )
+    # --- THE FILL FRACTION (D38's one mapping axis) -----------------------
+    # Same one sentence as the packing law and the link mode: the config
+    # declares it, an explicit keyword overrides it, there is no third source.
+    declared_fill = getattr(spec, "pp_util", None) if pp_util is None else pp_util
+    fill = (
+        PP_UTIL_FULL
+        if declared_fill is None
+        else check_pp_util(declared_fill, context="mapping.pp_util")
+    )
+    if fill != PP_UTIL_FULL and regime != REGIME_FILLED:
+        raise MappingError(
+            "execution",
+            f"mapping.pp_util = {fill} on a {regime!r} mapping. The fill fraction is a "
+            f"property of the FILLED PIPELINE — D38 defines it as 'resident streams = "
+            "pp_util x stages', and the retired lockstep regime has neither stages nor "
+            "resident streams. Drop pp_util, or lower this run under "
+            f"{REGIME_FILLED!r}.",
+        )
+    # --- THE PARTITION IS NOT AN INPUT (D38) ------------------------------
+    # Refused here as well as in `stage_partition`, because a LOCKSTEP mapping
+    # never calls the stage plan and would otherwise carry a declared partition
+    # that nothing reads.
+    if getattr(spec, "layers_per_stage", None) is not None:
+        raise MappingError(
+            "execution",
+            f"mapping.layers_per_stage = {spec.layers_per_stage!r} is REFUSED BY NAME "
+            "(D38): \"layers_per_stage RETIRES as a sweep axis. The machine is always "
+            "maximally disaggregated: local microbatch 1, finest motif-compatible "
+            "stages... Stage granularity DERIVES.\" One layer is one stage and no "
+            "input changes it. The axis that replaced it is mapping.pp_util, which "
+            f"moves the RESIDENT STREAMS over the stages ({PP_UTIL_VALUES}).",
+        )
+    if dense and phase == "prefill":
+        # D25 / D26: the refusal IS the implementation.
+        refuse_dead_fold(
+            "prefill_folding",
+            context=f"build_mapping(packing='dense', phase='prefill') for {system_id!r}",
+        )
+    # The model's own name wins, then the config's declared name, then the
+    # PRICING CARRIER as the last resort (which is what this was before a model
+    # could declare a name, so nothing already shipped moves).
+    model_id = (
+        model_id
+        or str(getattr(model, "model_id", "") or "")
+        or str(getattr(model, "model_type", "model"))
+    )
+    # The label names the MODEL, not the carrier: a page titled "llama decode
+    # mapping" over Granite-4.0-H-Tiny tiles tells a reader the wrong model.
+    label = label or f"{model_id} {phase} mapping"
+    notes: List[str] = []
+    relaxations: List[Relaxation] = [
+        Relaxation(
+            constraint="network_congestion",
+            value="not modeled",
+            reason=(
+                "A1 / D17: the fabric is fully-connected p2p, analytical. Boundary "
+                "bytes are placed and reported; no queueing, routing or topology term "
+                "exists anywhere in this mapping."
+            ),
+        ),
+        Relaxation(
+            constraint="intra_chip_activation_movement",
+            value="a dependency, not priced bytes",
+            reason=(
+                "D17 declares one network law and it is the p2p fabric BETWEEN chips. "
+                "Activations moving between macros of one chip are carried as DAG "
+                "dependencies with their byte count annotated and no link charge: no "
+                "on-chip interconnect law is declared anywhere, and inventing one would "
+                "be a number no card supports."
+            ),
+        ),
+        Relaxation(
+            constraint="op_durations",
+            value="unpriced (0.0)",
+            reason=(
+                "P3 places; P4 prices (A1). Every op in the emitted DAG carries a zero "
+                "duration and the annotation P4's pricing table needs. A number here "
+                "would be a second accounting of a metric P4 owns (D21)."
+            ),
+        ),
+    ]
+    carrier = str(getattr(model, "model_type", "") or "")
+    if carrier and carrier != model_id:
+        # D21's named-owner invariant is about a name a reader can TRUST. When
+        # the pricing carrier and the model's own id differ (Granite-4.0-H-Tiny
+        # declares model_type: llama for the SwiGLU gated MLP), every tile owner
+        # and every label reads the id, and the carrier is disclosed here rather
+        # than left to contradict it.
+        relaxations.append(
+            Relaxation(
+                constraint="model_type_carrier",
+                value=f"model_id {model_id!r}, model_param.model_type {carrier!r}",
+                reason=(
+                    f"This model is priced through the {carrier!r} carrier: model_type "
+                    "selects the FFN/attention arithmetic, not the model's identity. "
+                    f"Owners, labels and the atlas all name {model_id!r}; the carrier is "
+                    "named here so the two spellings are reconciled and not read as a "
+                    "contradiction."
+                ),
+            )
+        )
+
+    # --- degrees, checked against the settings that already carry them ----
+    sch = hw_config.sch_config
+    tp_hw = max(1, int(getattr(sch, "tp", 1) or 1))
+    tp = int(spec.parallelism.tp) if spec.parallelism.tp is not None else tp_hw
+    if spec.parallelism.tp is not None and tp != tp_hw:
+        raise MappingError(
+            "annotation",
+            f"mapping.parallelism.tp = {tp} disagrees with parallelism.tp = {tp_hw}. "
+            "One degree, one setting (D21); change the hardware parallelism block or "
+            "drop the mapping override.",
+        )
+    ep_hw = device.moe_expert_parallel
+    ep = int(spec.parallelism.ep) if spec.parallelism.ep is not None else ep_hw
+    if spec.parallelism.ep is not None and ep != ep_hw:
+        raise MappingError(
+            "annotation",
+            f"mapping.parallelism.ep = {ep} disagrees with cim.chip.moe_expert_parallel "
+            f"= {ep_hw}. One degree, one setting (D21).",
+        )
+    pp = int(spec.parallelism.pp) if spec.parallelism.pp is not None else 1
+    if pp > 1:
+        notes.append(
+            f"mapping.parallelism.pp = {pp} annotates chips only. ADJ-5 makes pp an "
+            "INDEPENDENT annotation (a chip index is not implicitly a pipeline stage), "
+            "and the hardware parallelism.pp stays 1, which the fws_cim run path "
+            "requires. The two axes share a name and nothing else."
+        )
+    degrees = {"tp": tp, "ep": ep, "pp": pp}
+
+    # --- THE STUB PACKER (stub-v0): does it place this run? ----------------
+    #
+    # The pipeline-order packer walks the model once, packs it densely and cuts
+    # a chip whenever the stream fills one — ACROSS stage boundaries. It needs
+    # ONE stream per tp shard to do that, so it places a run whose chips are
+    # all backbone chips of one pp stage: a MoE expert pool (ep > 1) and a
+    # declared pp membership are separate chip sets with their own placement,
+    # and the stub does not pretend to pack them. Such a run keeps the per-chip
+    # placement and says so by name, rather than being packed by a law that
+    # does not cover it.
+    stub_pack = bool(regime == REGIME_FILLED and dense and ep <= 1 and pp <= 1)
+    stub_skipped = ""
+    if regime == REGIME_FILLED and dense and not stub_pack:
+        stub_skipped = (
+            f"ep = {ep}, pp = {pp}: this mapping enumerates chip sets the "
+            "pipeline-order packer does not cover (a MoE expert pool and a declared "
+            "pp membership are placed as their own chips), so the weights are packed "
+            "PER CHIP as before and the chip partition is the declared one."
+        )
+    stub_capacity = 0
+    stub_packings: "OrderedDict[int, DensePacking]" = OrderedDict()
+    stub_tiles_by_chip: Dict[int, List[Tile]] = {}
+    stub_layers_of_chip: List[Tuple[int, ...]] = []
+
+    # --- layer -> chip ----------------------------------------------------
+    if stub_pack:
+        # ONE PASS TO SIZE THE MACHINE. The stream is the same shape on every
+        # tp shard, so the chip count is read off shard 0's packing and the
+        # per-shard streams are then packed at their own enumerated bases.
+        stub_capacity = int(device.analog_chip_slots())
+        probe = device.dense_pack(
+            _stub_requests(device, model, model_id, degrees, 0, tp),
+            first_macro_id=0,
+            walk=CANONICAL_WALK,
+        )
+        backbone_per_shard = max(1, -(-int(probe.macro_count) // stub_capacity))
+        counts = ()
+        placement_source = (
+            "the pipeline-order stub packer (stub-v0): "
+            f"{probe.macro_count} macros of one tp shard's stream cut into "
+            f"{backbone_per_shard} chip(s) of C = {stub_capacity} slot(s)"
+        )
+        layers_of_chip = []  # DERIVED below, off the tiles the packer placed
+    else:
+        if spec.layers_per_chip is None:
+            counts = device.chip_layer_counts()
+            placement_source = "cim.chip.layers_per_chip"
+        else:
+            counts = _layer_counts_from_spec(spec.layers_per_chip, device)
+            placement_source = "mapping.layers_per_chip"
+        backbone_per_shard = len(counts)
+        layers_of_chip = []
+        cursor = 0
+        for count in counts:
+            layers_of_chip.append(tuple(range(cursor, cursor + count)))
+            cursor += count
+
+    # --- macro slots per chip --------------------------------------------
+    declared_slots = int(getattr(device.chip, "arrays_per_chip", 0) or 0)
+    if stub_pack:
+        # CAPACITY IS AREA (the law layer's analog_chip_capacity). ADJ-13's
+        # per-point capacity probe retires with it: a derived capacity has
+        # nothing to discover. A declared count is REFUSED when it is the
+        # mapping block's own key (a claim about a quantity this run derives)
+        # and SUPERSEDED with a disclosure when it is the legacy card key,
+        # which nearly every shipped card still carries.
+        if spec.macros_per_chip is not None:
+            raise MappingError(
+                "residency",
+                f"mapping.macros_per_chip = {int(spec.macros_per_chip)} is REFUSED BY "
+                "NAME on a mapped fws_cim run: the analog chip's slot count is DERIVED "
+                f"from area — C = floor({ANALOG_CHIP_AREA_MM2:.6g} mm2 / this macro's "
+                f"package footprint) = {stub_capacity} slot(s) — and the pipeline-order "
+                "packer fills chips at that capacity. Two capacities is two accountings "
+                "of one fact (D21). Drop the key.",
+            )
+        macro_slots = stub_capacity
+    elif spec.macros_per_chip is not None:
+        macro_slots = int(spec.macros_per_chip)
+    elif declared_slots > 0:
+        macro_slots = declared_slots
+    else:
+        macro_slots = 0  # derived below, once the placement is known
+    if (
+        not stub_pack
+        and spec.macros_per_chip is not None
+        and declared_slots > 0
+        and macro_slots != declared_slots
+    ):
+        raise MappingError(
+            "assembly",
+            f"mapping.macros_per_chip = {macro_slots} disagrees with "
+            f"cim.chip.arrays_per_chip = {declared_slots}. A macro slot count has one "
+            "home (D21).",
+        )
+
+    # --- expert pool ------------------------------------------------------
+    num_moe_layers = p.num_moe_layers if p.use_moe else 0
+    expert_chips_per_shard = num_moe_layers * ep if ep > 1 and num_moe_layers else 0
+    if ep > 1 and p.use_moe and p.num_experts % ep != 0:
+        raise MappingError(
+            "assembly",
+            f"cim.chip.moe_expert_parallel = {ep} does not divide num_experts = "
+            f"{p.num_experts}: an expert chip would hold a fraction of an expert.",
+        )
+
+    # --- pp membership ----------------------------------------------------
+    analog_chips_per_shard = backbone_per_shard + expert_chips_per_shard
+    total_analog = tp * analog_chips_per_shard
+    pp_of_chip = _pp_membership(spec, pp, tp, backbone_per_shard, expert_chips_per_shard)
+
+    if spec.chips is not None and int(spec.chips) != total_analog:
+        raise MappingError(
+            "assembly",
+            f"mapping.chips = {spec.chips} but the placement enumerates {total_analog} "
+            f"analog chips ({tp} tp shard(s) x [{backbone_per_shard} backbone + "
+            f"{expert_chips_per_shard} expert-pool] chips from {placement_source}). "
+            "Chips are enumerated objects, never a quotient (D21).",
+        )
+
+    # --- residency: place the tiles --------------------------------------
+    card = device.card
+    rows = int(card.params.rows)
+    allocation_entries = _allocation_by_owner(device)
+    if dense and allocation_entries:
+        raise MappingError(
+            "residency",
+            "cim.allocation declares where tiles go and packing = 'dense' computes it. "
+            "Two placements of one tile is two accountings of one fact (D21): drop the "
+            "allocation block to pack densely, or keep it and pack 'dedicated'.",
+        )
+    if allocation_entries and macro_slots <= 0:
+        raise MappingError(
+            "residency",
+            "cim.allocation names macro ids, which are GLOBAL slot ids in this "
+            "placement, but no slot count is declared (cim.chip.arrays_per_chip = 0 "
+            "and mapping.macros_per_chip is absent). Declare one so a macro id means "
+            "the same thing to the config and to the mapper.",
+        )
+    chips: List[ChipRecord] = []
+    macros: List[MacroSlot] = []
+    all_tiles: List[Tile] = []
+    layer_chip: Dict[int, List[int]] = {}
+    next_chip_id = 0
+    macro_usage: Dict[int, int] = {}
+    auto_cursor: Dict[int, int] = {}
+    chip_requests: Dict[int, List[PackRequest]] = {}
+    packings: "OrderedDict[int, DensePacking]" = OrderedDict()
+
+    def _place(owner: TileOwner, stage: StageShape, chip_id: int, chip_macro_base: int):
+        """Enumerate one matrix's tiles onto the chip's next free macros.
+
+        Two cursors, on purpose: ``auto_cursor`` is where the ENUMERATOR packs
+        next, and ``macro_usage`` is the highest slot any tile reached. A user
+        allocation that jumps to slot 119 must not drag the enumerator's cursor
+        with it — the chip would then "need" 220 slots to hold 105 tiles. Two
+        tiles landing on one column set is caught by P2's capacity check with
+        its own named error, which is where that failure belongs.
+        """
+        if dense:
+            # Invariant W: nothing is placed per tensor. The chip's tensors are
+            # collected in offer order and packed as ONE bank stream once the
+            # chip is complete, which is what keeps a layer's tensors adjacent
+            # (and therefore on one chip) without the packer reordering them.
+            chip_requests.setdefault(chip_id, []).append(
+                PackRequest(
+                    owner=owner,
+                    k=stage.k,
+                    n=stage.n,
+                    group=f"{owner.model}.L{owner.layer}",
+                )
+            )
+            return ()
+        used = auto_cursor.get(chip_id, 0)
+        tiles = device.enumerate_tiles(
+            stage.k, stage.n, owner, first_macro_id=chip_macro_base + used
+        )
+        entries = allocation_entries.get(_owner_key(owner))
+        if entries:
+            tiles = _apply_user_allocation(tiles, entries, owner.label)
+            for tile in tiles:
+                if not (chip_macro_base <= tile.site.macro_id < chip_macro_base + macro_slots):
+                    raise MappingError(
+                        "residency",
+                        f"cim.allocation puts {owner.label} on macro "
+                        f"{tile.site.macro_id}, which is outside chip {chip_id}'s slot "
+                        f"range [{chip_macro_base}, {chip_macro_base + macro_slots}). A "
+                        "tile lives on the chip its owner's layer is assigned to.",
+                    )
+        validate_tile_row_convention(tiles, rows)
+        reach = max(tile.site.macro_id for tile in tiles) - chip_macro_base + 1
+        if not entries:
+            auto_cursor[chip_id] = max(used, reach)
+        macro_usage[chip_id] = max(macro_usage.get(chip_id, 0), reach)
+        all_tiles.extend(tiles)
+        return tiles
+
+    # --- THE STUB PACKER RUNS HERE (stub-v0) ------------------------------
+    #
+    # One stream per tp shard, packed from the shard's own enumerated macro
+    # base, and the chip a macro belongs to is the slot arithmetic itself:
+    # chip = macro_id // C. The stream crosses stage boundaries, so a layer
+    # whose matrices straddle a cut sits on TWO chips and the layer -> chip map
+    # says so. Nothing here chooses a partition; the capacity does.
+    if stub_pack:
+        for tp_idx in range(tp):
+            shard_base = tp_idx * backbone_per_shard * macro_slots
+            shard_packing = device.dense_pack(
+                _stub_requests(device, model, model_id, degrees, tp_idx, tp),
+                first_macro_id=shard_base,
+                walk=CANONICAL_WALK,
+            )
+            validate_tile_row_convention(shard_packing.tiles, rows)
+            # THE PACKING IS ONE STREAM, so it is recorded once — under the
+            # FIRST chip it filled. Recording it under every chip it touches
+            # would count its cells once per chip, which is exactly the second
+            # accounting D21 forbids.
+            stub_packings[tp_idx * backbone_per_shard] = shard_packing
+            for tile in shard_packing.tiles:
+                chip_id = int(tile.site.macro_id) // macro_slots
+                stub_tiles_by_chip.setdefault(chip_id, []).append(tile)
+        for local in range(backbone_per_shard):
+            layers = sorted(
+                {int(tile.owner.layer) for tile in stub_tiles_by_chip.get(local, ())}
+            )
+            stub_layers_of_chip.append(tuple(layers))
+        layers_of_chip = list(stub_layers_of_chip)
+
+    moe_layer_indices = [idx for idx, is_moe in enumerate(device.layer_class_mask()) if is_moe]
+    tiles_by_chip: Dict[int, List[Tile]] = {}
+    macro_base_of_chip: Dict[int, int] = {}
+    chip_specs: List[Tuple[int, str, ShardCoord, Tuple[int, ...], str]] = []
+    for tp_idx in range(tp):
+        for chip_index in range(backbone_per_shard):
+            shard = ShardCoord(tp=tp_idx, ep=0, pp=pp_of_chip[len(chip_specs)])
+            chip_specs.append(
+                (next_chip_id, f"analog chiplet {chip_index}, tp shard {tp_idx}", shard,
+                 layers_of_chip[chip_index], "backbone")
+            )
+            next_chip_id += 1
+        for expert_slot in range(expert_chips_per_shard):
+            layer = moe_layer_indices[expert_slot // ep]
+            ep_index = expert_slot % ep
+            shard = ShardCoord(tp=tp_idx, ep=ep_index, pp=pp_of_chip[len(chip_specs)])
+            chip_specs.append(
+                (next_chip_id, f"expert-pool chiplet {expert_slot}, tp shard {tp_idx}",
+                 shard, (layer,), "expert_pool")
+            )
+            next_chip_id += 1
+
+    endpoints = _endpoint_shapes(device, tp)
+    if regime == REGIME_FILLED and endpoints:
+        # D30: embedding and lm_head are DROPPED ENTIRELY. There is no endpoint
+        # array, no endpoint stage and no note — so a model that still declares
+        # them is refused BY NAME rather than quietly placed and then ignored
+        # somewhere downstream.
+        raise MappingError(
+            "residency",
+            "D30 drops embedding and lm_head ENTIRELY on the fws_cim mapped path, but "
+            f"this model declares the endpoint stage(s) "
+            f"{', '.join(sorted({stage.op for _where, stage in endpoints}))}. Set "
+            "model_param.disable_embedding_unembedding: true (it is the enforced "
+            "default for a mapped fws_cim run, not a knob), or lower the run under the "
+            f"retired {REGIME_LOCKSTEP!r} regime, which still places endpoints. A "
+            "ViT-shaped model cannot disable its patch embedding or head in the schema, "
+            "so a ViT runs only under the lockstep regime.",
+        )
+    #: Chips are enumerated slot ranges: chip i owns macro ids
+    #: [i * macro_slots, (i+1) * macro_slots). When the slot count is derived
+    #: (arrays_per_chip = 0) it is not known yet, so placement runs on a
+    #: per-chip LOCAL base and the ids are shifted into their ranges below.
+    slots_known = macro_slots > 0
+    for chip_index, (chip_id, chip_label, shard, chip_layers, chip_role) in enumerate(chip_specs):
+        chip_macro_base = chip_index * macro_slots if slots_known else chip_index * _LOCAL_BASE_STRIDE
+        macro_base_of_chip[chip_id] = chip_macro_base
+        macro_usage[chip_id] = 0
+        auto_cursor[chip_id] = 0
+        tiles_by_chip[chip_id] = []
+        shard_index = int(_linearize(degrees, shard))
+        chip_index_in_shard = [c[0] for c in chip_specs if c[2].tp == shard.tp].index(chip_id)
+        if stub_pack and chip_role == "backbone":
+            # The tiles are already placed: this chip is a WINDOW on the
+            # shard's one stream, [chip_macro_base, +C). Its layers were read
+            # off those tiles, so the layer -> chip map is the packing's own
+            # answer and not a second placement of the same weights.
+            resident_tiles = list(stub_tiles_by_chip.get(chip_id, ()))
+            tiles_by_chip[chip_id] = resident_tiles
+            all_tiles.extend(resident_tiles)
+            for layer in chip_layers:
+                layer_chip.setdefault(layer, []).append(chip_id)
+            used = {int(tile.site.macro_id) for tile in resident_tiles}
+            macro_usage[chip_id] = len(used)
+            auto_cursor[chip_id] = len(used)
+            if chip_id in stub_packings:
+                packings[chip_id] = stub_packings[chip_id]
+            continue
+        if chip_role == "backbone":
+            if chip_index_in_shard == 0:
+                for where, stage in endpoints:
+                    if where != "head":
+                        continue
+                    owner = TileOwner(model_id, 0, stage.op, -1, shard_index)
+                    tiles_by_chip[chip_id].extend(_place(owner, stage, chip_id, chip_macro_base))
+            for layer in chip_layers:
+                layer_chip.setdefault(layer, []).append(chip_id)
+                for stage in _shard_shapes(device, model, layer, tp):
+                    if stage.routed and ep > 1:
+                        continue  # the routed experts left for the expert pool
+                    owner = TileOwner(model_id, layer, stage.op, stage.expert, shard_index)
+                    tiles_by_chip[chip_id].extend(_place(owner, stage, chip_id, chip_macro_base))
+            if chip_index_in_shard == backbone_per_shard - 1:
+                for where, stage in endpoints:
+                    if where != "tail":
+                        continue
+                    owner = TileOwner(model_id, p.num_layers - 1, stage.op, -1, shard_index)
+                    tiles_by_chip[chip_id].extend(_place(owner, stage, chip_id, chip_macro_base))
+        else:
+            layer = chip_layers[0]
+            layer_chip.setdefault(layer, []).append(chip_id)
+            per_chip = p.num_experts // ep
+            first = shard.ep * per_chip
+            for stage in _shard_shapes(device, model, layer, tp):
+                if not stage.routed or not (first <= stage.expert < first + per_chip):
+                    continue
+                owner = TileOwner(model_id, layer, stage.op, stage.expert, shard_index)
+                tiles_by_chip[chip_id].extend(_place(owner, stage, chip_id, chip_macro_base))
+        if dense:
+            # The chip is complete: pack its tensors as one stream (D27). The
+            # K-INNER walk is the only one on offer (D26), so a tensor's K
+            # blocks stay in one macro whenever the bank granularity lets them.
+            chip_packing = device.dense_pack(
+                chip_requests.get(chip_id, ()),
+                first_macro_id=chip_macro_base,
+                walk=CANONICAL_WALK,
+            )
+            packings[chip_id] = chip_packing
+            validate_tile_row_convention(chip_packing.tiles, rows)
+            tiles_by_chip[chip_id] = list(chip_packing.tiles)
+            all_tiles.extend(chip_packing.tiles)
+            macro_usage[chip_id] = chip_packing.macro_count
+            auto_cursor[chip_id] = chip_packing.macro_count
+
+    # macro slots: derive when the config declares none, and disclose it.
+    peak_usage = max(macro_usage.values()) if macro_usage else 0
+    if macro_slots <= 0:
+        macro_slots = max(1, peak_usage)
+        relaxations.append(
+            Relaxation(
+                constraint="mapping.macros_per_chip",
+                value=f"derived = {macro_slots}",
+                reason=(
+                    "cim.chip.arrays_per_chip is 0 (capacity checking disabled), so the "
+                    "chip's slot count is derived from the placement itself and every "
+                    "chip is exactly full. No capacity was checked."
+                ),
+            )
+        )
+    if not slots_known:
+        # Shift each chip's locally-numbered tiles into its enumerated range.
+        shifted: List[Tile] = []
+        for chip_index, (chip_id, _label, _shard, _layers, _role) in enumerate(chip_specs):
+            delta = chip_index * macro_slots - macro_base_of_chip[chip_id]
+            macro_base_of_chip[chip_id] = chip_index * macro_slots
+            if dense:
+                # A packing is a bank STREAM from a base, so it is re-packed at
+                # the enumerated base rather than shifted: the same stream, with
+                # its fills and K stacks naming the ids the mapping ships.
+                chip_packing = device.dense_pack(
+                    chip_requests.get(chip_id, ()),
+                    first_macro_id=chip_index * macro_slots,
+                    walk=CANONICAL_WALK,
+                )
+                packings[chip_id] = chip_packing
+                moved = list(chip_packing.tiles)
+            else:
+                moved = [
+                    replace(tile, site=replace(tile.site, macro_id=tile.site.macro_id + delta))
+                    for tile in tiles_by_chip[chip_id]
+                ]
+            tiles_by_chip[chip_id] = moved
+            shifted.extend(moved)
+        all_tiles = shifted
+    for chip_id, used in macro_usage.items():
+        if used > macro_slots:
+            raise MappingError(
+                "assembly",
+                f"chip {chip_id} needs {used} macro slots but the chip declares "
+                f"{macro_slots} (cim.chip.arrays_per_chip / mapping.macros_per_chip). "
+                "Reduce layers_per_chip, raise the slot count, or shard further.",
+            )
+
+    # --- enumerate macros (every slot, reserved ones included) ------------
+    next_device_id = 0
+    card_id = _analog_card_id(device)
+    for chip_index, (chip_id, chip_label, shard, chip_layers, chip_role) in enumerate(chip_specs):
+        base = macro_base_of_chip[chip_id]
+        by_macro = OrderedDict()
+        for tile in tiles_by_chip[chip_id]:
+            by_macro.setdefault(tile.site.macro_id, []).append(tile)
+        macro_ids = []
+        for slot in range(macro_slots):
+            macro_id = base + slot
+            resident = tuple(by_macro.get(macro_id, ()))
+            macros.append(
+                MacroSlot(
+                    macro_id=macro_id,
+                    chip_id=chip_id,
+                    slot=slot,
+                    pool="analog",
+                    card_id=card_id,
+                    shard=shard,
+                    tiles=resident,
+                    reserved=(
+                        None
+                        if resident
+                        else "unallocated macro slot on an enumerated chip "
+                             "(ADJ-5: unowned capacity is legal and reported)"
+                    ),
+                    analog_device=next_device_id,
+                    pool_device=next_device_id + 1,
+                )
+            )
+            macro_ids.append(macro_id)
+            next_device_id += 2
+        chips.append(
+            ChipRecord(
+                chip_id=chip_id,
+                label=chip_label,
+                pool="analog",
+                shard=shard,
+                macro_slots=macro_slots,
+                macro_ids=tuple(macro_ids),
+                layers=tuple(chip_layers),
+                role=chip_role,
+            )
+        )
+
+    # --- shared digital chiplets (D13, ADJ-5) -----------------------------
+    suggestion = total_analog
+    shared = int(spec.shared_chiplets) if spec.shared_chiplets is not None else suggestion
+    if shared <= 0 and _needs_shared_digital(model):
+        raise MappingError(
+            "execution",
+            "mapping.shared_chiplets = 0 but the workload has act x act compute "
+            "(attention, scan or delta-rule state) which D13 puts on the shared digital "
+            "chiplet. There is no device to place those ops on.",
+        )
+    if shared != suggestion:
+        notes.append(
+            f"shared digital chiplets: {shared} declared against a derived suggestion of "
+            f"{suggestion} (one per analog chip, the concurrency the closed-form spatial "
+            "pipeline assumes). ADJ-5 makes the count a config input; the suggestion is "
+            "reported and binds nothing."
+        )
+    digital_card_id = _digital_card_id(device)
+    next_macro_id = len(chip_specs) * macro_slots
+    # THE PLACEMENT'S ENGINE-SLOT CENSUS, from the DECLARED geometry. ADJ-10
+    # DERIVES cim.fabric.num_arrays, but the derivation needs a priced timeline
+    # and this runs before one exists, so the slots enumerated here are the
+    # declared seed's. That is not a second accounting of the fabric's width:
+    # these slots hold no tile, carry no device (a chiplet is ONE device with
+    # one queue) and price no time — they are a placement record. The width
+    # that prices the silicon, the power and the attention time is the DERIVED
+    # one, and cim_timing.DerivedFabricSizing reconciles the two by name in its
+    # own disclosures (D21).
+    engines_per_chiplet = max(
+        1, int(device.fabric.num_arrays) * max(1, int(getattr(device.fabric, "replicas", 1) or 1))
+    )
+    for index in range(shared):
+        chip_id = next_chip_id
+        next_chip_id += 1
+        shard = ShardCoord(tp=index % tp if tp > 1 else 0, ep=0, pp=0)
+        macro_ids = []
+        for slot in range(engines_per_chiplet):
+            macro_id = next_macro_id
+            next_macro_id += 1
+            macros.append(
+                MacroSlot(
+                    macro_id=macro_id,
+                    chip_id=chip_id,
+                    slot=slot,
+                    pool="digital",
+                    card_id=digital_card_id,
+                    shard=shard,
+                    tiles=(),
+                    reserved=(
+                        "shared digital chiplet engine: act x act GEMM, softmax, scan and "
+                        "state update (D13). It stores no weights, so its stored-column "
+                        "occupancy is 0."
+                    ),
+                    analog_device=-1,
+                    pool_device=-1,
+                )
+            )
+            macro_ids.append(macro_id)
+        chips.append(
+            ChipRecord(
+                chip_id=chip_id,
+                label=f"shared digital chiplet {index}",
+                pool="digital",
+                shard=shard,
+                macro_slots=engines_per_chiplet,
+                macro_ids=tuple(macro_ids),
+                layers=(),
+                role="shared_digital",
+            )
+        )
+
+    # --- devices (A2): two per analog macro, one per shared chiplet -------
+    devices: List[FwsDevice] = []
+    chip_position: Dict[Tuple[int, int], int] = {}
+    for chip in chips:
+        key = (chip.shard.tp, 0 if chip.pool == "analog" else 1)
+        position = chip_position.get(key, 0)
+        chip_position[key] = position + 1
+        if chip.pool == "analog":
+            for macro_id in chip.macro_ids:
+                macro = next(m for m in macros if m.macro_id == macro_id)
+                devices.append(
+                    FwsDevice(
+                        device_id=macro.analog_device,
+                        device_class="analog_macro",
+                        chip_id=chip.chip_id,
+                        macro_id=macro_id,
+                        shard=chip.shard,
+                        role_key=(position, macro.slot, "analog_macro"),
+                    )
+                )
+                devices.append(
+                    FwsDevice(
+                        device_id=macro.pool_device,
+                        device_class="macro_pool",
+                        chip_id=chip.chip_id,
+                        macro_id=macro_id,
+                        shard=chip.shard,
+                        role_key=(position, macro.slot, "macro_pool"),
+                    )
+                )
+        else:
+            devices.append(
+                FwsDevice(
+                    device_id=next_device_id,
+                    device_class="shared_digital",
+                    chip_id=chip.chip_id,
+                    macro_id=-1,
+                    shard=chip.shard,
+                    role_key=(position, 0, "shared_digital"),
+                )
+            )
+            next_device_id += 1
+
+    # --- final capacity check over the placed sites (P2's named error) ----
+    device.validate_macro_capacity(all_tiles)
+    device.validate_allocation()
+
+    # --- the stage plan: D29's PP stages, and D = the stage count ---------
+    stages: List[PipelineStage] = []
+    stage_basis = ""
+    if regime == REGIME_FILLED:
+        stage_layers, stage_basis = stage_partition(
+            int(p.num_layers),
+            getattr(spec, "layers_per_stage", None),
+            tuple(layers_of_chip),
+            tuple(pp_of_chip[:backbone_per_shard]),
+            pp,
+        )
+        for index, stage_layer_ids in enumerate(stage_layers):
+            hosts = sorted(
+                {
+                    chip_id
+                    for layer in stage_layer_ids
+                    for chip_id in layer_chip.get(layer, ())
+                }
+            )
+            stages.append(
+                PipelineStage(
+                    index=index,
+                    layers=tuple(stage_layer_ids),
+                    chips=tuple(hosts),
+                    label=(
+                        f"stage {index}: layers {stage_layer_ids[0]}-"
+                        f"{stage_layer_ids[-1]}"
+                    ),
+                )
+            )
+        relaxations.append(
+            Relaxation(
+                constraint="serving_regime",
+                value=(
+                    f"{REGIME_FILLED} (D29 + D38): {len(stages)} stage(s), pp_util = "
+                    f"{fill}, D = {resident_streams_of(len(stages), fill)} resident "
+                    "stream(s), local batch 1"
+                ),
+                reason=(
+                    f"{len(stages)} PP stages from {stage_basis}; D = "
+                    f"{resident_streams_of(len(stages), fill)} resident streams = "
+                    f"round(pp_util {fill} x stages), DERIVED and never configured as a "
+                    "batch (D29 removes batch size from this surface; D38 makes the "
+                    "FILL the axis). At pp_util = 1.0 the pipeline is ALWAYS FULL and "
+                    "this is D29 unchanged: decode is independent streams staggered one "
+                    "stage apart, one token exits per BEAT, throughput = 1/beat. Below "
+                    "1.0 the entries are spaced stages/D beats apart, D tokens leave "
+                    "every `stages` beats, and the throughput is the full pipeline's "
+                    "scaled by the fill. Every analog op fires at M = 1 and "
+                    "attention/scan are priced per stream at that stream's own context. "
+                    "EVERY stage holds all D streams' state and KV for its layers, "
+                    "which the evaluation reports per stage and checks against the "
+                    "declared tiers."
+                ),
+            )
+        )
+    else:
+        relaxations.append(
+            Relaxation(
+                constraint="serving_regime",
+                value=f"{REGIME_LOCKSTEP} (RETIRED D15 semantics)",
+                reason=(
+                    "This mapping is lowered as ONE batch of same-length requests "
+                    "stepping through the whole model together, which is what the "
+                    "pass-1/2 closed form models and what the ADJ-8 bridge compares "
+                    "against. D29 SUPERSEDED it for fws_cim: the shipped regime is the "
+                    f"filled pipeline ({REGIME_FILLED!r}), and every run that declares "
+                    "a `mapping:` block gets it. This run does not declare one (or "
+                    "asked for lockstep by name), so it is the degenerate comparison "
+                    "mode: its batch, its endpoints and its per-step semantics are the "
+                    "retired ones and none of its numbers is a D29 result."
+                ),
+            )
+        )
+    # THE MEASUREMENT WINDOW IS DERIVED, NOT DECLARED (M3/M10).
+    #
+    # The window must be long enough that the beat it reports is the machine's
+    # rhythm rather than its ramp. A pipeline with uneven stage service times is
+    # still settling for on the order of D beats after it fills, so a window
+    # shorter than the stage count reports the ramp: Granite's derived beat
+    # moved 2.3x between window 3 and window 14 on a hand-set 3, and settled to
+    # within 5% only once the window reached the stage count.
+    #
+    # So the floor is the stage count - every stage is then observed in steady
+    # state at least once. A card may still declare a LARGER window (more
+    # measurement is never wrong); a smaller one is raised to the floor and the
+    # raise is disclosed. This costs lowering time and buys a number that does
+    # not move with the knob. It changes NO silicon: the store is sized from the
+    # served request, never from the window.
+    _declared_window = int(spec.decode_window or 0)
+    _window_floor = len(stages) if regime == REGIME_FILLED and phase == "decode" else 0
+    decode_window = max(_declared_window or DEFAULT_DECODE_WINDOW, _window_floor)
+    _window_raised = decode_window > (_declared_window or DEFAULT_DECODE_WINDOW)
+    if regime == REGIME_FILLED and phase == "decode":
+        # Under D29 the window is measured in BEATS, not in a request's decode
+        # steps: the DAG lowers D - 1 beats of fill plus `decode_window` beats
+        # of steady state, and a request's own decode_len is an extrapolation
+        # the evaluation labels as one. Reporting "3 of 256 steps" here would
+        # name a quantity this DAG does not lower.
+        relaxations.append(
+            Relaxation(
+                constraint="decode_window",
+                value=(
+                    f"{lowered_beats(len(stages), resident_streams_of(len(stages), fill), decode_window)} "
+                    f"beats lowered ({len(stages) - 1} to fill the pipeline, then "
+                    f"{decode_window} STEADY inter-exit intervals measured)"
+                ),
+                reason=(
+                    (
+                        f"DERIVED: raised from the declared "
+                        f"{_declared_window or DEFAULT_DECODE_WINDOW} to the stage count "
+                        f"{len(stages)} so every stage is observed in steady state at "
+                        "least once; a shorter window reports the ramp. "
+                        if _window_raised else ""
+                    )
+                    + "ADJ-6 bounds the lowered window; D29 makes the unit a BEAT. The "
+                    f"pipeline needs {len(stages) - 1} beats to fill (one per stage "
+                    "after the first, whatever the fill); "
+                    f"{decode_window + 2} traversals then complete inside the window and "
+                    f"their {decode_window + 1} inter-exit intervals are measured, of "
+                    "which the FIRST is held out (that traversal travelled through a "
+                    "filling pipeline, so nothing queued behind it and its exit is "
+                    f"early). The beat is the median of the remaining {decode_window}. "
+                    f"The declared decode_len ({decode_len} tokens per request) never "
+                    "enters the DAG: a request's decode phase is decode_len x D x beat "
+                    "and the evaluation prints it in its extrapolation block, labeled."
+                ),
+            )
+        )
+    elif phase == "decode" and decode_len > decode_window:
+        relaxations.append(
+            Relaxation(
+                constraint="decode_window",
+                value=f"{decode_window} of {decode_len} steps lowered",
+                reason=(
+                    "ADJ-6: the DAG grows linearly in the decode length, so a bounded "
+                    "window is lowered and the remaining steps are an extrapolation the "
+                    "consumer must declare. P3 lowers the window and states the bound; "
+                    "it extrapolates nothing."
+                ),
+            )
+        )
+
+    # (1) THE MAPPING IS A STUB, and EVERY MAPPED RUN SAYS SO — filled or
+    # lockstep. This used to sit inside the `regime == REGIME_FILLED` guard
+    # below, which contradicted the constant's own contract ("Every artifact of
+    # a mapped run carries it BY NAME") and left the lockstep artifacts — every
+    # ViT point, among others — with no stub disclosure at all. A reader could
+    # not tell a stub-round result from a designed one on those pages.
+    #
+    # The VALUE is verbatim in both regimes, because it names the STUB ROUND
+    # this artifact belongs to and a grep for it must find every page of it.
+    # The REASON is regime-aware, because on lockstep the three mechanisms the
+    # value names did not actually run, and printing that they did would be a
+    # false statement about the machine. Both readings end in the same place:
+    # the result is not design-valid.
+    _stub_reason = MAPPING_STUB_REASON
+    if regime != REGIME_FILLED:
+        _stub_reason = (
+            MAPPING_STUB_REASON
+            + f" THIS RUN IS {regime!r}, NOT THE FILLED PIPELINE: the pipeline-order "
+            "packer, the per-layer stage plan and the resident-stream state bill "
+            "named in the value above did NOT run on it — the retired lockstep "
+            "regime places per chip and has no stage plan at all. What binds THIS "
+            "point is that per-chip placement. The value names the stub round the "
+            "artifact belongs to, and the conclusion is unchanged: NOT DESIGN-VALID "
+            "until the mapping law lands."
+        )
+    relaxations.append(
+        Relaxation(
+            constraint=MAPPING_STUB_KEY,
+            value=MAPPING_STUB_VALUE,
+            reason=_stub_reason,
+        )
+    )
+
+    # --- THE STUB ROUND'S DISCLOSURES (one per fact, each by name) --------
+    stub_tail_slots = 0
+    if regime == REGIME_FILLED:
+        # (2) THE FILL, when it is not the full pipeline D29 assumed.
+        _stage_count = len(stages)
+        _residents = resident_streams_of(_stage_count, fill)
+        if fill != PP_UTIL_FULL:
+            relaxations.append(
+                Relaxation(
+                    constraint="pipeline_underfill",
+                    value=(
+                        f"mapping.pp_util = {fill}: D = {_residents} resident stream(s) "
+                        f"over {_stage_count} stage(s) (realized fill "
+                        f"{(_residents / _stage_count) if _stage_count else 0.0:.6g})"
+                    ),
+                    reason=(
+                        "D38: \"THE NEW AXIS: pp_util in {1.0, 0.75, 0.5} - a "
+                        "deliberately UNDERFILLED pipeline (resident streams = pp_util x "
+                        "stages). Trades state/KV area (linear in resident streams) "
+                        "against throughput (linear in fill).\" THIS PIPELINE IS NOT "
+                        "FULL: only D of its stages hold a stream at any beat, so the "
+                        "machine emits D tokens every `stages` beats and its throughput "
+                        "is the full pipeline's scaled by the realized fill. The saving "
+                        "is state and KV: every stage holds D streams' worth, not "
+                        "`stages` streams' worth. Both halves are measured, not "
+                        "asserted - the DAG lowers exactly D streams and spaces their "
+                        "entries by stages/D, so one accounting produces both."
+                    ),
+                )
+            )
+        # (3) THE LINK PRICES, whenever the hop law is what charged the handoffs.
+        if links != LINKS_ZEROED:
+            relaxations.append(
+                Relaxation(
+                    constraint="stage_handoff_hop_prices",
+                    value=(
+                        f"intra-chip {T_HOP_INTRA_CHIP * 1e9:.6g} ns, cross-chip "
+                        f"{T_HOP_CROSS_CHIP * 1e9:.6g} ns, intra-macro 0 s"
+                    ),
+                    reason=" ".join(link_price_disclosures()),
+                )
+            )
+    if stub_pack:
+        _shard_macros = int(
+            stub_packings[0].macro_count if 0 in stub_packings else 0
+        )
+        stub_tail_slots = backbone_per_shard * macro_slots - _shard_macros
+        for line in analog_chip_capacity_disclosures(device.macro_footprint_mm2()):
+            if line not in notes:
+                notes.append(line)
+        relaxations.append(
+            Relaxation(
+                constraint="pipeline_order_packing",
+                value=(
+                    f"C = {macro_slots} slot(s)/chip, {_shard_macros} macro(s) per tp "
+                    f"shard in {backbone_per_shard} chip(s), tail_slots = "
+                    f"{stub_tail_slots}"
+                ),
+                reason=(
+                    "The stub packer walks ONE stream per tp shard in pipeline order "
+                    "and cuts a chip every C macros, ACROSS stage boundaries: a layer "
+                    "whose matrices straddle a cut sits on two chips, which the layer "
+                    "-> chip map reports. There is exactly ONE tail - the slots the "
+                    "stream did not reach in the last chip it filled - and it is the "
+                    "number above; every other chip is full by construction. C is "
+                    "DERIVED from area by the law layer, so cim.chip.arrays_per_chip "
+                    "and mapping.macros_per_chip place nothing here and ADJ-13's "
+                    "per-point capacity probe retires with them. The declared "
+                    "partition (cim.chip.layers_per_chip / mapping.layers_per_chip) is "
+                    "SUPERSEDED: D38 makes the machine maximally disaggregated and the "
+                    "capacity decides where a chip ends. The packing is recorded once "
+                    "per stream, under the first chip it filled, so its cells are "
+                    "counted once."
+                ),
+            )
+        )
+    elif stub_skipped:
+        relaxations.append(
+            Relaxation(
+                constraint="pipeline_order_packing",
+                value="not applied",
+                reason=(
+                    f"{stub_skipped} The stub packer places a mapped run's backbone as "
+                    "one pipeline-order stream per tp shard; this run is placed by the "
+                    "per-chip law instead, and its chip count is the declared "
+                    f"partition's ({placement_source})."
+                ),
+            )
+        )
+
+    blocks = sorted({tile.owner.op for tile in all_tiles})
+    endpoint_blocks = sorted({stage.op for _, stage in endpoints})
+    mapping = FwsMapping(
+        device=device,
+        hw_config=hw_config,
+        model_config=model,
+        system_id=system_id,
+        role=role,
+        phase=phase,
+        label=label,
+        model_id=model_id,
+        degrees=degrees,
+        chips=chips,
+        macros=macros,
+        devices=devices,
+        tiles=all_tiles,
+        blocks=blocks,
+        endpoint_blocks=endpoint_blocks,
+        layer_chip=layer_chip,
+        shared_chiplet_suggestion=suggestion,
+        decode_window=decode_window,
+        notes=notes,
+        relaxations=relaxations,
+        packing=packing,
+        packings=packings,
+        links=links,
+        regime=regime,
+        stages=tuple(stages),
+        stage_basis=stage_basis,
+        pp_util=fill,
+        chip_capacity=stub_capacity,
+        tail_slots=stub_tail_slots,
+    )
+    if dense:
+        summary = mapping.packing_summary()
+        seen: List[str] = []
+        for chip_packing in packings.values():
+            for disclosure in chip_packing.disclosures:
+                if disclosure not in seen:
+                    seen.append(disclosure)
+        identity = (
+            "This packing IS the dedicated placement (0 macros saved): the degenerate "
+            "identity holds and every number downstream is the one today's placement "
+            "produces."
+            if summary["macros_saved"] == 0
+            else (
+                f"Dense packing reaches {summary['macros']} analog macros where the "
+                f"per-tensor placement reaches {summary['dedicated_macros']}: "
+                f"{summary['macros_saved']} macros of analog silicon that held no "
+                "weights now hold some. The delta is stated here rather than left for a "
+                "reader to notice."
+            )
+        )
+        mapping._relaxations = mapping._relaxations + (
+            Relaxation(
+                constraint="packing",
+                value=(
+                    f"dense (Invariant W, D27): {summary['macros']} macros, "
+                    f"global cell floor {summary['cell_floor_macros']}, waste "
+                    f"{summary['waste_pct']:.3f}%"
+                ),
+                reason=(
+                    "Every bank of every macro holds real weights; waste is the "
+                    f"dimension-mismatch remainder ({summary['remainder_cells']} cells) "
+                    f"plus the unfilled tail of a last macro ({summary['tail_cells']} "
+                    f"cells), and nothing else. {identity} K stacks: "
+                    f"{summary['local_k_stacks']} in-macro (one accumulator per macro "
+                    f"under the k_inner walk) and {summary['spread_k_stacks']} spread "
+                    "across macros (priced by the existing row-block partial-sum law)."
+                ),
+            ),
+        )
+        mapping.notes = mapping.notes + tuple(seen)
+    return mapping
+
+
+def _linearize(degrees: Mapping[str, int], shard: ShardCoord) -> int:
+    span = 1
+    out = 0
+    for axis in MAPPING_AXES:
+        out += shard.of(axis) * span
+        span *= max(1, int(degrees[axis]))
+    return out
+
+
+def _owner_key(owner: TileOwner) -> Tuple[str, int, str, int, int]:
+    return (owner.model, owner.layer, owner.op, owner.expert, owner.shard)
+
+
+def _allocation_by_owner(device: CimDeviceModel) -> Dict[Tuple, List[object]]:
+    allocation = device.allocation
+    if allocation is None:
+        return {}
+    by_owner: Dict[Tuple, List[object]] = {}
+    for entry in allocation.assignments:
+        key = (entry.model, entry.layer, entry.op, entry.expert, entry.shard)
+        by_owner.setdefault(key, []).append(entry)
+    return by_owner
+
+
+def _layer_counts_from_spec(spec_value, device: CimDeviceModel) -> Tuple[int, ...]:
+    num_layers = int(device.params.num_layers)
+    if isinstance(spec_value, str):
+        return device.derive_auto_layers_per_chip()
+    if isinstance(spec_value, tuple):
+        if sum(spec_value) != num_layers:
+            raise MappingError(
+                "assembly",
+                f"mapping.layers_per_chip {list(spec_value)} sums to {sum(spec_value)} but "
+                f"the model has num_layers = {num_layers}.",
+            )
+        return spec_value
+    per_chip = int(spec_value)
+    num_chips = math.ceil(num_layers / per_chip)
+    counts = [per_chip] * (num_chips - 1)
+    counts.append(num_layers - per_chip * (num_chips - 1))
+    return tuple(counts)
+
+
+def _pp_membership(
+    spec, pp: int, tp: int, backbone: int, expert: int
+) -> Tuple[int, ...]:
+    """Per-analog-chip pp index: declared membership, or derived by layer order."""
+    per_shard = backbone + expert
+    total = tp * per_shard
+    declared = spec.membership.get("pp") if spec is not None else None
+    if declared is not None:
+        if len(declared) != total:
+            raise MappingError(
+                "annotation",
+                f"mapping.membership.pp lists {len(declared)} entries but the placement "
+                f"enumerates {total} analog chips. Membership is per chip, in chip-id "
+                "order.",
+            )
+        bad = [index for index in declared if index >= pp]
+        if bad:
+            raise MappingError(
+                "annotation",
+                f"mapping.membership.pp names stage(s) {sorted(set(bad))} but "
+                f"mapping.parallelism.pp = {pp} declares stages 0..{pp - 1}.",
+            )
+        missing = sorted(set(range(pp)) - set(declared))
+        if missing:
+            raise MappingError(
+                "annotation",
+                f"mapping.parallelism.pp = {pp} but no chip is assigned to stage(s) "
+                f"{missing}. An empty pipeline stage is a degree nothing uses.",
+            )
+        return tuple(int(index) for index in declared)
+    if pp > backbone:
+        raise MappingError(
+            "annotation",
+            f"mapping.parallelism.pp = {pp} exceeds the {backbone} backbone chips per tp "
+            "shard, so the derived membership would leave a stage empty. Declare "
+            "mapping.membership.pp, or reduce pp.",
+        )
+    out: List[int] = []
+    for _ in range(tp):
+        for chip_index in range(backbone):
+            out.append(chip_index * pp // backbone)
+        for _ in range(expert):
+            out.append(0)
+    return tuple(out)
+
+
+def _needs_shared_digital(model) -> bool:
+    kinds = set(getattr(model, "block_kinds", ("attention",)) or ("attention",))
+    return bool(kinds & {"attention", "ssm", "linear_attn"})
+
+
+def _analog_card_id(device: CimDeviceModel) -> str:
+    cards = getattr(device.cim, "cards", None)
+    name = getattr(cards, "default_analog", None) if cards is not None else None
+    return str(name or "analog_macro")
+
+
+def _digital_card_id(device: CimDeviceModel) -> str:
+    cards = getattr(device.cim, "cards", None)
+    name = getattr(cards, "default_digital", None) if cards is not None else None
+    return str(name or "shared_digital")
+
+
+# ---------------------------------------------------------------------------
+# PD disaggregation (P3.4, D16)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PDHandoff:
+    """The one coupling between a prefill system and a decode system (D16).
+
+    Bytes only: the KV of the prefilled context plus the recurrent/hidden state
+    that seeds decode. No precision conversion is modeled — a seventh-order
+    effect, explicitly out of scope.
+    """
+
+    kv_bytes: float
+    state_bytes: float
+    bandwidth_bytes_per_s: float
+    latency_s: float
+    time_s: float
+    basis: str
+
+    @property
+    def total_bytes(self) -> float:
+        return float(self.kv_bytes) + float(self.state_bytes)
+
+
+@dataclass(frozen=True)
+class PDPair:
+    """Two inventories, two mappings, one handoff (D16, ADJ-5)."""
+
+    prefill: FwsMapping
+    decode: FwsMapping
+    handoff: PDHandoff
+
+    def summary(self) -> Dict[str, object]:
+        return OrderedDict(
+            (
+                ("prefill", self.prefill.summary()),
+                ("decode", self.decode.summary()),
+                ("handoff_bytes", self.handoff.total_bytes),
+                ("handoff_kv_bytes", self.handoff.kv_bytes),
+                ("handoff_state_bytes", self.handoff.state_bytes),
+                ("handoff_time_s", self.handoff.time_s),
+            )
+        )
+
+    def report(self) -> str:
+        lines = [self.prefill.report(), self.decode.report()]
+        lines.append(
+            f"[FWS-CIM]   PD handoff: {self.handoff.total_bytes:.6g} B "
+            f"(KV {self.handoff.kv_bytes:.6g} + state {self.handoff.state_bytes:.6g}) "
+            f"-> {self.handoff.time_s * 1e6:.6f} us on the declared p2p link. "
+            f"{self.handoff.basis}"
+        )
+        return "\n".join(lines)
+
+
+def pd_handoff_bytes(mapping: FwsMapping) -> Tuple[float, float, str]:
+    """(KV bytes, state bytes, basis) one request hands from prefill to decode."""
+    dev = mapping.device
+    model = mapping.model
+    precision = mapping.hw.sw_config.precision
+    kv_precision = float(precision.kv_cache)
+    act_bytes = float(precision.activations)
+    p = dev.params
+    seq_len = int(p.seq_len)
+    decode_len = int(getattr(model, "decode_len", 0) or 0)
+    prefill_len = max(1, seq_len - decode_len)
+    batch = int(p.batch_size)
+    kv_bytes = 0.0
+    if not p.is_vit_shaped:
+        # tp = 1 on purpose: the handoff carries the WHOLE KV of the request.
+        # How each side shards it is that side's mapping, not the wire's.
+        kv_bytes = batch * dev.kv_bytes_per_stream(prefill_len, kv_precision, 1)
+    state_bytes = float(batch) * float(p.hidden_dim) * act_bytes
+    ssm = getattr(model, "ssm", None)
+    ssm_layers = 0
+    for kinds in getattr(model, "layer_mixers", ()) or ():
+        if "ssm" in kinds:
+            ssm_layers += 1
+    if ssm is not None and ssm_layers:
+        d_inner = int(ssm.resolve_d_inner(int(p.hidden_dim)))
+        state_bytes += float(batch) * d_inner * int(ssm.d_state) * ssm_layers * act_bytes
+    basis = (
+        f"KV = batch {batch} x kv_bytes_per_stream(context = {prefill_len}, tp = 1); "
+        f"state = batch x hidden {p.hidden_dim} x act"
+        + (f" + {ssm_layers} SSM recurrent states" if ssm_layers else "")
+        + ". No precision conversion is modeled (D16)."
+    )
+    return kv_bytes, state_bytes, basis
+
+
+def build_pd_pair(
+    hw_config,
+    model_config,
+    *,
+    prefill_spec=None,
+    decode_spec=None,
+    label: str = "PD pair",
+) -> PDPair:
+    """Two systems and the priced handoff (D16). Equal specs = one machine.
+
+    ``None`` specs take the hardware config's ``mapping.pd`` block. Setting the
+    two halves equal reproduces the non-disaggregated machine exactly: both
+    inventories are the unified mapping, and the only extra quantity is the
+    handoff byte count.
+
+    The handoff is priced under the halves' LINK PRICING MODE: ``priced`` (the
+    default) charges it the D17 p2p law, ``zeroed`` prices it at 0 s like every
+    other inter-chip transfer of that run. The two halves must declare the same
+    mode — one wire, one law.
+    """
+    mapping_config = getattr(hw_config, "mapping_config", None)
+    if prefill_spec is None and mapping_config is not None:
+        prefill_spec = mapping_config.prefill
+    if decode_spec is None and mapping_config is not None:
+        decode_spec = mapping_config.decode
+    if prefill_spec is None or decode_spec is None:
+        raise MappingError(
+            "assembly",
+            "a PD pair needs BOTH a prefill spec and a decode spec (mapping.pd.prefill "
+            "and mapping.pd.decode). D16 is two inventories and one handoff; one half "
+            "alone is not a machine.",
+        )
+    prefill = build_mapping(
+        hw_config,
+        model_config,
+        spec=prefill_spec,
+        system_id="sys.prefill",
+        role="prefill",
+        phase="prefill",
+        label=f"{label} — prefill system",
+    )
+    decode = build_mapping(
+        hw_config,
+        model_config,
+        spec=decode_spec,
+        system_id="sys.decode",
+        role="decode",
+        phase="decode",
+        label=f"{label} — decode system",
+    )
+    kv_bytes, state_bytes, basis = pd_handoff_bytes(prefill)
+    bandwidth, latency = hw_config.network_layout.link_for_parallelism("pp")
+    total = kv_bytes + state_bytes
+    # --- the LINK PRICING MODE reaches the D16 handoff too -----------------
+    # This handoff IS an inter-chip boundary transfer: it rides the same pp
+    # link and the same D17 p2p law every other one rides, and it is the
+    # LARGEST hop in a PD machine. A mode that vacates that law has to reach
+    # it, or a zeroed run prints a nonzero inter-chip time beside a disclosure
+    # that says every inter-chip transfer is 0 s. The two halves declare the
+    # mode independently and ONE wire cannot be priced two ways, so a
+    # disagreement is refused by name rather than silently resolved.
+    if prefill.links != decode.links:
+        raise MappingError(
+            "package",
+            f"mapping.pd.prefill.links = {prefill.links!r} and mapping.pd.decode.links "
+            f"= {decode.links!r} disagree, and the D16 handoff is ONE wire between the "
+            "two halves: it cannot be charged the D17 p2p law by one side and relaxed "
+            "to 0 s by the other. Declare the SAME link pricing mode on both halves.",
+        )
+    if prefill.links == LINKS_ZEROED:
+        handoff_time = 0.0
+        handoff_basis = (
+            f"{basis} Handoff priced at 0 s: mapping.links = '{LINKS_ZEROED}', the "
+            "TEMPORARY relaxation (disclosed as links_zeroed on every artifact of "
+            "both halves). The BYTES above are untouched; only the TIME is relaxed."
+        )
+    else:
+        handoff_time = CimDeviceModel.p2p_time_s(total, bandwidth, latency)
+        handoff_basis = basis
+    handoff = PDHandoff(
+        kv_bytes=kv_bytes,
+        state_bytes=state_bytes,
+        bandwidth_bytes_per_s=bandwidth,
+        latency_s=latency,
+        time_s=handoff_time,
+        basis=handoff_basis,
+    )
+    return PDPair(prefill=prefill, decode=decode, handoff=handoff)

@@ -1,0 +1,2207 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""L4 — ``build()``: compose L1 + L2 + L3 into a :class:`Program` (INTERFACES §4).
+
+**Deps are COMPUTED, never walked off a mutable graph.** There are exactly four
+dependency classes (:class:`~program.work.DepClass`) and four rules, applied in
+this order (INTERFACES §4.3):
+
+===  =========================================================================
+R1   data flow inside one ``ExpandedChain`` (``DepClass.DATA_FLOW``)
+R2   cross-layer ``L -> L+1``: same device => dep, different device => one
+     ``TransferOp`` (``DepClass.DATA_FLOW``)
+R3   device serialization implied by the ``SchedulePolicy``
+     (``DepClass.SCHEDULE``) — added ONLY when not already transitively
+     implied (invariant **D1**)
+R4   sync attach from each ``SyncRequirement``'s declared ``AttachMode``
+     (``DepClass.SYNC``), resolved in a declared :class:`SyncOrder`
+===  =========================================================================
+
+What this module does NOT contain, and must never grow:
+
+* **no proto graph** — there is one representation, the ops built here;
+* **no clone cache** — a WorkItem is expanded once per device by
+  :class:`~program.placement.BlockExpander`, and nothing is copied;
+* **no adjacency walking** — no ``for child in node.children`` over a mutable
+  object graph; every edge is added by a rule that names both endpoints;
+* **no name dispatch** — not one ``"optimizer" in name`` / ``"bwd" in name`` /
+  ``"attention" in name`` test. Every decision reads a typed field of a
+  ``WorkItem``, a ``CommSpec`` or a policy object (rule §8.2). The ONE
+  string comparison left is :class:`~program.policies.overlap.OverlapDecl`'s
+  ``blocking_consumer`` against ``ComputeStep.entry_name`` — and that string is
+  DATA on the policy, not a literal in this file.
+
+**Program order** (INTERFACES §4.6) is a documented deterministic function
+
+    key(op) = (slot_index, device_index, intra_index)
+
+with ``intra_index = (phase, a, b)`` — see :meth:`_Builder._order` — and uids
+are assigned by Kahn's algorithm over the complete dep graph with a min-heap on
+that key. Keys are unique by construction, so the order is total, is
+schedule-major (AstraSim node ids are scheduling priorities — CONTEXT.md), and
+is a pure function of the inputs (**O1**).
+"""
+
+from __future__ import annotations
+
+import heapq
+import math
+from bisect import bisect_left, bisect_right
+from dataclasses import dataclass, field
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
+
+from timing_model import CollectiveType
+
+from program.groups import canonical_axis_label
+from program.ir import (
+    CollectiveOp,
+    CommGroup,
+    ComputeOp,
+    GroupKey,
+    Op,
+    OpRole,
+    Program,
+    ProgramMeta,
+    TransferOp,
+)
+from program.ir import Direction as IRDirection
+from program.placement import (
+    LEGACY_PLACEMENT,
+    BlockExpander,
+    CommStep,
+    ComputeStep,
+    ExpandedChain,
+    Granularity,
+    Placement,
+    PlacementPolicy,
+    StepKind,
+)
+from program.policies.gradaccum import GradAccumPolicy, grad_accum_policy_for
+from program.policies.overlap import (
+    AxisFractionOverlap,
+    OverlapAnchor,
+    OverlapDecl,
+    OverlapPolicy,
+)
+from program.policies.recompute import RecomputePolicy
+from program.policies.routing import MoERoutingPolicy, ep_sync_requirements
+from program.policies.sharding import ShardingContext, ShardingPolicy
+from program.schedule.policy import Schedule, SchedulePolicy
+from program.types import DP_AXIS, CommKey, DeviceId
+from program.work import (
+    AttachMode,
+    ByteSource,
+    ByteSplit,
+    DepClass,
+    Direction,
+    SyncAnchor,
+    SyncKey,
+    SyncPhase,
+    SyncRequirement,
+    WorkItem,
+    WorkKind,
+    WorkSet,
+    enumerate_work,
+)
+from program.workload import FrozenWorkload
+
+__all__ = [
+    "BuildError",
+    "SyncOrder",
+    "build",
+    "check_granularity_preconditions",
+    "restrict_work_for",
+]
+
+
+
+def _pricing_axis(axes: Sequence[str]) -> Optional[str]:
+    """The axis key a collective is PRICED against (``WorkloadSpec.interconnect``).
+
+    Distinct from ``axes``, which declares MEMBERSHIP. They coincide for every
+    single-axis collective; they diverge for the ``dp x cp`` gradient reducer
+    (**BUG_LEDGER 19**), whose members span two axes but whose cost is dominated
+    by the dp fabric — the outer, slower network the reduction has to cross.
+    ``canonical_axis_label`` would hand the analytical evaluator ``"cp+dp"``,
+    which is not a key in the interconnect table
+    (``analytic_sim``: ``Invalid interconnect type``).
+
+    Rule: a communicator that spans dp prices as dp; otherwise the canonical
+    label, unchanged. Memoized per axes tuple — one call per collective
+    INSTANCE, a handful of distinct answers.
+    """
+    if not axes:
+        return None
+    axes = tuple(axes)
+    cached = _PRICING_MEMO.get(axes)
+    if cached is None:
+        cached = DP_AXIS if DP_AXIS in axes else canonical_axis_label(axes)
+        _PRICING_MEMO[axes] = cached
+    return cached
+
+
+_PRICING_MEMO: Dict[Tuple[str, ...], str] = {}
+
+
+class BuildError(ValueError):
+    """A Program could not be composed from the given policies."""
+
+
+#: The cross-layer activation transfer. THE only comm key ``build()`` names, and
+#: it names it once: R2 is the rule that owns pipeline data movement
+#: (``train_timing._build_comm_metadata`` registers it at ``:4429-4435``).
+CROSS_LAYER_KEY: CommKey = "cross_layer"
+
+
+# ---------------------------------------------------------------------------
+# SyncOrder (INTERFACES §4.4)
+# ---------------------------------------------------------------------------
+
+#: FWD_ENTRY < FWD < GRAD < BWD_ENTRY < BWD (INTERFACES §4.4).
+_PHASE_RANK: Mapping[SyncPhase, int] = {
+    SyncPhase.FWD_ENTRY: 0,
+    SyncPhase.FWD: 1,
+    SyncPhase.GRAD: 2,
+    SyncPhase.BWD_ENTRY: 3,
+    SyncPhase.BWD: 4,
+}
+
+
+@dataclass(frozen=True)
+class SyncOrder:
+    """The total order in which :class:`SyncRequirement`s are resolved.
+
+    A NAMED POLICY, not an accident of construction order. ``attach_parallel_edge``
+    reads the *current* parents/children of a mutable object, so today the result
+    depends on which lattice block ran first (the forward ZeRO-3 block at
+    ``schedule.py:848-892`` runs before the backward GPipe wiring at ``:955-976``;
+    the backward ZeRO-3 block at ``:978-1046`` runs after). That is not
+    reproducible from a declaration set, so it is replaced by this declared order
+    (INTERFACES §4.4).
+    """
+
+    name: str = "phase_major"
+
+    def key(self, req: SyncRequirement) -> Tuple[Any, ...]:
+        key = req.key
+        return (
+            _PHASE_RANK[key.phase],
+            -1 if key.microbatch is None else int(key.microbatch),
+            -1 if key.layer is None else int(key.layer),
+            str(key.comm_key),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Proto nodes — the pre-uid form. One representation; these become ops 1:1.
+# ---------------------------------------------------------------------------
+
+
+#: The order key: ``(slot_index, device_index, phase, a, b)``. ``phase`` orders
+#: the four construction rules within one (slot, device); ``a``/``b`` make each
+#: rule's own emission deterministic. All five components are ints, so the tuple
+#: is totally ordered and unique by construction (INTERFACES §4.6).
+_OrderKey = Tuple[int, int, int, int, int]
+
+_PHASE_CHAIN = 0  #: R1 steps (``a`` = chain position; ``b`` = split sub-index)
+_PHASE_XFER = 1  #: R2 transfers (``a`` = R2 emission sequence)
+_PHASE_SYNC = 2  #: R4 sync ops (``a`` = SyncOrder rank, ``b`` = instance index)
+
+
+#: The WorkKinds a BLOCK build can express. BLOCK's device space is
+#: ``layout.subset(("tp","cp","ep"))`` — it carries NO ``pp`` and no ``dp`` axis —
+#: so pipeline work is not representable there at all: INTERFACES §3.1 defines
+#: BLOCK as "one layer expanded over the (tp,cp,ep) sublayout only, no pipeline",
+#: and the builder it replaces (``block_program.build_block_program``) takes ONE
+#: ``BlockTemplate`` and ONE direction and nothing else.
+_BLOCK_KINDS: Tuple[WorkKind, ...] = (WorkKind.LAYER, WorkKind.RECOMPUTE)
+
+#: The work kinds whose BACKWARD direction produces a weight gradient, i.e. what
+#: **R5** makes the optimizer wait for. Same set as
+#: ``schedule.policy._GRADIENT_KINDS`` (which uses it to answer "which microbatch
+#: finishes last"); named here so R5 does not reach into L3's private table.
+_R5_GRADIENT_KINDS: Tuple[WorkKind, ...] = (
+    WorkKind.LAYER,
+    WorkKind.EMBEDDING,
+    WorkKind.SOFTMAX,
+)
+
+
+def restrict_work_for(
+    granularity: Granularity,
+    work: WorkSet,
+    *,
+    directions: Optional[Sequence[Direction]] = None,
+) -> WorkSet:
+    """The work a granularity (and caller) can express (INTERFACES §3.1).
+
+    PIPELINE and FLAT express the whole workload. BLOCK expresses transformer-block
+    work only — see :data:`_BLOCK_KINDS`. Stated as one named function so the
+    coupling is visible in a dumped program
+    (``meta.misc["work_restricted"]``) instead of being an accident of which
+    dispatcher built the spec.
+
+    ``directions`` is the AMENDMENT 2026-07-28 that makes §4.2's own consequence
+    expressible: "``build()`` at BLOCK produces ONE program containing both
+    directions ... a caller measuring a single direction builds a single
+    direction's workload". AstraSim returns ONE makespan per bundle, so the
+    hybrid/hierarchical retiming — which needs a forward time AND a backward time
+    — genuinely needs two bundles. ``None`` means "every direction".
+    """
+    items = work.items
+    if granularity is Granularity.BLOCK:
+        items = tuple(item for item in items if item.kind in _BLOCK_KINDS)
+    if directions is not None:
+        allowed = tuple(directions)
+        items = tuple(item for item in items if item.direction in allowed)
+    if items is work.items:
+        return work
+    return WorkSet(items=items)
+
+
+def check_granularity_preconditions(granularity: Granularity, fw: FrozenWorkload) -> None:
+    """What a granularity REQUIRES of its workload (INTERFACES §3.1).
+
+    BLOCK's device space is ``layout.subset(("tp","cp","ep"))``: it carries
+    neither ``pp`` nor ``dp``, so a BLOCK workload must declare neither. This is
+    the legacy ``dp_override=1`` semantics stated as a precondition instead of
+    left implicit — ``block_program.build_block_program`` takes one template and
+    emits with ``dp_count=1`` because a transformer-block run is a SINGLE-REPLICA
+    measurement. Enforcing it here is what makes the data-parallel policy
+    selection need no granularity special case at all: at ``dp == 1``
+    ``sharding_policy_for`` answers ``NullSharding`` and ``GradAccumPolicy.emits``
+    is unconditionally False, so neither the ZeRO lattice nor the EP grad sync
+    can leak into a block measurement.
+    """
+    if granularity is not Granularity.BLOCK:
+        return
+    degrees = fw.spec.degrees
+    if int(degrees.dp) != 1 or int(degrees.pp) != 1:
+        raise BuildError(
+            "Granularity.BLOCK requires a single-replica, single-stage workload "
+            f"(got dp={degrees.dp}, pp={degrees.pp}). BLOCK's device space is the "
+            "(tp,cp,ep) sublayout, which carries no dp and no pp axis; a block "
+            "run is a single-replica measurement (legacy dp_override=1). Build "
+            "the block spec with dp=pp=1, or use Granularity.FLAT."
+        )
+
+
+#: WorkKind -> the semantic role of a single-op expansion. Keyed on the enum,
+#: never on a name (this is what deletes ``pipeline_fine.py:417`` /``:426``).
+_ROLE_BY_KIND: Mapping[WorkKind, OpRole] = {
+    WorkKind.EMBEDDING: OpRole.EMBEDDING,
+    WorkKind.SOFTMAX: OpRole.SOFTMAX,
+    WorkKind.LAYER: OpRole.TRANSFORMER_LAYER,
+    WorkKind.RECOMPUTE: OpRole.TRANSFORMER_LAYER,
+    WorkKind.OPTIMIZER: OpRole.OPTIMIZER,
+}
+
+
+# ---------------------------------------------------------------------------
+# build()
+# ---------------------------------------------------------------------------
+
+
+def build(
+    fw: FrozenWorkload,
+    *,
+    granularity: Granularity,
+    sharding: ShardingPolicy,
+    schedule_policy: SchedulePolicy,
+    recompute: RecomputePolicy,
+    routing: Optional[MoERoutingPolicy] = None,
+    overlap: OverlapPolicy = AxisFractionOverlap(),
+    grad_accum: Optional[GradAccumPolicy] = None,
+    dp_count: Optional[int] = None,
+    label: str = "",
+    gmap_workdir: Optional[str] = None,
+    placement_policy: PlacementPolicy = LEGACY_PLACEMENT,
+    sync_order: SyncOrder = SyncOrder(),
+    validate: bool = True,
+    check_group_membership: bool = True,
+    directions: Optional[Sequence[Direction]] = None,
+) -> Program:
+    """Compose L1 + L2 + L3 into a :class:`~program.ir.Program`.
+
+    Mechanical: no policy decision of its own. Phases, in this exact order
+    (INTERFACES §4.2):
+
+    1. ``work      = enumerate_work(fw, recompute)``                    (L1)
+    2. ``schedule  = schedule_policy.schedule(fw, work)``               (L3)
+    3. ``placement = Placement(fw, granularity, schedule.layers)``      (L2)
+    4. ``chains    = BlockExpander(...).expand(item) for item in work`` (L2)
+    5. ``deps      = R1 + R2``                                          (§4.3)
+    6. ``deps     += R3`` from ``schedule.implied_deps``                (§4.3)
+    7. ``reqs      = sharding + routing requirements``                  (L1)
+    8. ``deps     += R4``, materializing the sync ops                   (§4.4)
+    9. realize every ``OverlapDecl``                                    (§4.5)
+    10. program order (§4.6); assign uids; build Program; validate
+
+    ``grad_accum`` defaults to ``grad_accum_policy_for(fw)`` rebound to the
+    schedule (:meth:`GradAccumPolicy.for_schedule` — Class B 10h is data, not a
+    hardcoded ``0``). ``dp_count`` defaults to ``run.retime_dp_count(degrees)``.
+
+    ``gmap_workdir`` is RECORDED in ``meta.misc`` for the emission step; this
+    function writes no files. The first-dimension SCOTCH collection is an
+    emission-side concern (P5 wires it), and silently doing nothing with a path
+    would be worse than saying so.
+
+    ``check_group_membership`` enables invariant **V7** — every member device
+    of a communicator issues the group's collectives — and DEFAULTS TO ON
+    since 2026-08-02 (perf pass 4, "fix possible deadlocks"): a violated group
+    is a SILENT AstraSim deadlock, the check is one O(collectives) pass, and
+    the only reason it was opt-in — legacy-lowered per-device clone programs,
+    for which V7 is false by construction — was deleted with the lowering.
+    It used to contradict BUG_LEDGER **A2** (``SyncSpread.CLUSTER_RANK_0``);
+    A2 is fixed (final wave) and ``check_group_membership=True`` was measured
+    clean over 192 PIPELINE+FLAT configurations (``dp/tp/cp/ep/pp`` in ``{1,2}``
+    x ``zero_stage`` in ``{0,2,3}`` x dense/MoE). A caller hand-building a
+    clone-style Program can still pass False.
+    """
+    builder = _Builder(
+        fw=fw,
+        granularity=granularity,
+        sharding=sharding,
+        schedule_policy=schedule_policy,
+        recompute=recompute,
+        routing=routing,
+        overlap=overlap,
+        grad_accum=grad_accum,
+        dp_count=dp_count,
+        label=label,
+        gmap_workdir=gmap_workdir,
+        placement_policy=placement_policy,
+        sync_order=sync_order,
+        directions=directions,
+    )
+    return builder.run(
+        validate=validate, check_group_membership=check_group_membership
+    )
+
+
+class _Builder:
+    """One build. Every phase is a method, called once, in §4.2's order."""
+
+    def __init__(
+        self,
+        *,
+        fw: FrozenWorkload,
+        granularity: Granularity,
+        sharding: ShardingPolicy,
+        schedule_policy: SchedulePolicy,
+        recompute: RecomputePolicy,
+        routing: Optional[MoERoutingPolicy],
+        overlap: OverlapPolicy,
+        grad_accum: Optional[GradAccumPolicy],
+        dp_count: Optional[int],
+        label: str,
+        gmap_workdir: Optional[str],
+        placement_policy: PlacementPolicy,
+        sync_order: SyncOrder,
+        directions: Optional[Sequence[Direction]] = None,
+    ) -> None:
+        self._fw = fw
+        self._granularity = granularity
+        self._sharding = sharding
+        self._schedule_policy = schedule_policy
+        self._recompute = recompute
+        self._routing = routing
+        self._overlap = overlap
+        self._grad_accum_in = grad_accum
+        self._dp_count_in = dp_count
+        self._label = label
+        self._gmap_workdir = gmap_workdir
+        self._placement_policy = placement_policy
+        self._sync_order = sync_order
+        self._directions = directions
+
+        #: THE ops — real IR instances, built ONCE (perf pass 3, 2026-08-02;
+        #: the former ``_Proto*`` mirror classes and the second construction in
+        #: ``_finish`` are deleted). During the build: ``uid`` holds the dense
+        #: construction NID, ``deps`` (and a transfer's ``consumers``) are
+        #: mutable LISTS, and a collective's ``label`` is None; ``_finish``
+        #: renumbers uids/deps in place, retypes the lists to tuples and
+        #: assigns labels in uid order. Builder-only per-node facts that the IR
+        #: deliberately does NOT carry (P5 deleted ordering metadata from ops)
+        #: live in the side arrays below, indexed by nid.
+        self._nodes: List[Op] = []
+        self._orders: List[_OrderKey] = []
+        self._succs: List[List[int]] = []
+        self._entry_names: List[Optional[str]] = []
+        #: Slots of the CROSS-DEVICE dep edges that exist BEFORE R3 runs,
+        #: classified by the direction of the work that produced them (perf
+        #: pass 4, 2026-08-02). R3's window certificate bisects these: a
+        #: boundary window containing cross edges of ONE phase direction only
+        #: (and no stage-0-delta MoE cross-rank edge) is stage-monotone, so an
+        #: off-device ancestor cone can never re-enter the query's device and
+        #: the same-device-restricted walk is EXACT — checked, not assumed.
+        self._cross_slots_fwd: List[int] = []
+        self._cross_slots_bwd: List[int] = []
+        self._cross_slots_other: List[int] = []
+        #: Edge EXISTENCE as a plain set, with the class annotation SPARSE
+        #: (perf pass 5, 2026-08-02): ~all edges carry exactly {DATA_FLOW}, and
+        #: a per-edge one-element set costs 216 B and an allocation — 13M of
+        #: them (~2.8 GB) at GPT-1T scale. ``_edge_classes`` holds ONLY the
+        #: edges whose class set is not the pure-DATA_FLOW default; ``_classes``
+        #: answers the default for the rest, which reproduces the old
+        #: ``edges.get(key) or {DATA_FLOW}`` semantics exactly. An edge exists
+        #: once; a second rule adding it contributes its class, not a duplicate.
+        self._edges: Set[Tuple[int, int]] = set()
+        self._edge_classes: Dict[Tuple[int, int], Set[DepClass]] = {}
+        #: ``work -> chains``, and ``(work, device) -> the chain's node ids``.
+        self._chains: Dict[WorkItem, Tuple[ExpandedChain, ...]] = {}
+        self._chain_nodes: Dict[Tuple[WorkItem, int], List[int]] = {}
+        self._chain_by_device: Dict[Tuple[WorkItem, int], ExpandedChain] = {}
+        #: ``SyncKey -> the node ids the requirement materialized on``.
+        self._sync_nodes: Dict[SyncKey, List[int]] = {}
+        #: The subset of ``_sync_nodes`` whose requirement declared
+        #: ``is_reducer`` — R5b's source set. Recorded here because R5 runs
+        #: after R4 and no longer has the requirements.
+        self._reducer_keys: Set[SyncKey] = set()
+        #: Requirements declaring ``after_update`` — R5b's SUCCESSOR set.
+        self._after_update_keys: Set[SyncKey] = set()
+        #: R5/R5b edges, recorded so **D1** stays checkable on the artifact:
+        #: R3 eliminates an edge only against the graph R3 SAW, and R5 runs
+        #: after R4, so an R3 edge can be subsumed later without R3 having
+        #: been wrong. The test skips these when re-deriving reachability.
+        self._r5_edges: List[Tuple[int, int]] = []
+        #: R4 edges, recorded for the SAME reason as ``_r5_edges``: R4 also runs
+        #: after R3, so its sync attachments can subsume an R3 edge that was
+        #: not redundant when R3 added it. ``AttachMode.BEFORE`` does this by
+        #: construction — it inserts the requirement between the target and the
+        #: target's own deps, so every dep of the target gains a second, longer
+        #: path to it. Row S1 never showed it (the forward entry gather attaches
+        #: to the program root, which has no incoming schedule edge); the
+        #: stage-entry gathers A6 introduced do.
+        self._r4_edges: List[Tuple[int, int]] = []
+        #: When not ``None``, :meth:`_add_dep` appends every NEW edge here.
+        self._edge_recorder: Optional[List[Tuple[int, int]]] = None
+        #: overlap work list: ``(collective nid, decl, producing compute nid)``.
+        self._overlap_sites: List[Tuple[int, OverlapDecl, Optional[int]]] = []
+        self._xfer_seq = 0
+        self._cross_layer_bytes: Optional[float] = None
+        self._dropped_requirements: List[str] = []
+
+    # ==================================================================
+    # phases
+    # ==================================================================
+    def run(self, *, validate: bool, check_group_membership: bool = False) -> Program:
+        fw = self._fw
+        # 1 / 2 / 3 -------------------------------------------------------
+        check_granularity_preconditions(self._granularity, fw)
+        full_work = enumerate_work(fw, self._recompute)
+        self._work: WorkSet = restrict_work_for(
+            self._granularity, full_work, directions=self._directions
+        )
+        self._work_restricted = len(self._work) != len(full_work)
+        self._schedule: Schedule = self._schedule_policy.schedule(fw, self._work)
+        self._schedule.check_permutation(self._work)
+        self._placement = Placement(
+            fw, self._granularity, self._schedule.layers, policy=self._placement_policy
+        )
+        self._devices: Tuple[DeviceId, ...] = self._placement.devices()
+        self._device_pos: Dict[int, int] = {
+            int(device): index for index, device in enumerate(self._devices)
+        }
+        self._grad_accum = (
+            self._grad_accum_in
+            if self._grad_accum_in is not None
+            else grad_accum_policy_for(fw)
+        ).for_schedule(self._schedule)
+
+        # 4 / 5 -----------------------------------------------------------
+        self._expand_all()
+        self._apply_r2()
+        # 6 ---------------------------------------------------------------
+        self._apply_r3()
+        # 7 / 8 -----------------------------------------------------------
+        # Recorded so D1 stays exactly re-derivable on the artifact: R4 runs
+        # after R3 and can subsume an R3 edge (see ``_r4_edges``).
+        self._edge_recorder = self._r4_edges
+        try:
+            self._apply_r4(self._collect_requirements())
+        finally:
+            self._edge_recorder = None
+        # 8b ---------------------------------------------------------------
+        self._apply_r5()
+        # 9 ---------------------------------------------------------------
+        self._realize_overlap()
+        # 10 --------------------------------------------------------------
+        return self._finish(
+            validate=validate, check_group_membership=check_group_membership
+        )
+
+    # ------------------------------------------------------------------
+    # node / edge primitives
+    # ------------------------------------------------------------------
+    def _order(
+        self, work: Optional[WorkItem], device: int, phase: int, a: int, b: int = 0
+    ) -> _OrderKey:
+        """``(slot_index, device_index, phase, a, b)`` — INTERFACES §4.6.
+
+        ``slot_index`` is ``Schedule.index_of`` of the OWNING WorkItem: a sync op
+        inherits its ``place_on`` item's index, a ``TransferOp`` its producer's,
+        a split op its source's. ``device_index`` is the position of the device
+        in ``placement.devices()``.
+        """
+        slot = -1 if work is None else self._schedule.index_of(work)
+        position = self._device_pos.get(int(device))
+        if position is None:
+            raise BuildError(
+                f"device {device} is not one of placement.devices() {self._devices}"
+            )
+        return (slot, position, phase, a, b)
+
+    def _add_op(
+        self, op: Op, order: _OrderKey, entry_name: Optional[str] = None
+    ) -> int:
+        """Register ``op`` (whose ``uid`` must equal the next nid) with its
+        builder-side order key."""
+        self._nodes.append(op)
+        self._orders.append(order)
+        self._succs.append([])
+        self._entry_names.append(entry_name)
+        return op.uid
+
+    def _next_nid(self) -> int:
+        return len(self._nodes)
+
+    def _add_dep(self, dep: int, node: int, dep_class: DepClass) -> None:
+        """Add ``dep -> node`` with ``dep_class``; idempotent per (edge, class).
+
+        Idempotence is what reproduces ``attach_parallel_edge``'s ``not in``
+        guards (``schedule.py:556,566``) without a membership scan over a
+        children list.
+        """
+        if dep == node:
+            raise BuildError(f"self-dependency on node {dep}")
+        key = (dep, node)
+        if key not in self._edges:
+            self._edges.add(key)
+            if dep_class is not DepClass.DATA_FLOW:
+                self._edge_classes[key] = {dep_class}
+            self._nodes[node].deps.append(dep)
+            self._succs[dep].append(node)
+            if self._edge_recorder is not None:
+                self._edge_recorder.append(key)
+        else:
+            classes = self._edge_classes.get(key)
+            if classes is not None:
+                classes.add(dep_class)
+            elif dep_class is not DepClass.DATA_FLOW:
+                # promote: the implicit pure-DATA_FLOW default gains a class
+                self._edge_classes[key] = {DepClass.DATA_FLOW, dep_class}
+
+    def _classes(self, dep: int, node: int) -> Set[DepClass]:
+        """The classes carried by ``dep -> node``; ``{DATA_FLOW}`` if absent."""
+        key = (dep, node)
+        classes = self._edge_classes.get(key)
+        if classes is not None:
+            return set(classes)
+        return {DepClass.DATA_FLOW}
+
+    def _reparent_dep(self, dep: int, node: int, *, like: Tuple[int, int]) -> None:
+        """Add ``dep -> node`` carrying the classes of the edge ``like``.
+
+        Overlap realization (§4.5) MOVES edges; it does not invent them. Adding
+        the moved edge as ``DATA_FLOW`` unconditionally erased the original
+        class, which matters because ``PARALLEL_TO``'s ``via`` filter dispatches
+        on it (§2.2) and because ``meta.misc["schedule_edges"]`` is derived from
+        it.
+        """
+        for dep_class in self._classes(*like):
+            self._add_dep(dep, node, dep_class)
+
+    def _drop_dep(self, dep: int, node: int) -> None:
+        """Remove ``dep -> node`` entirely. Used ONLY by overlap realization
+        (§4.5), which re-parents rather than adds."""
+        key = (dep, node)
+        if key not in self._edges:
+            return
+        self._edges.discard(key)
+        self._edge_classes.pop(key, None)
+        self._nodes[node].deps.remove(dep)
+        self._succs[dep].remove(node)
+
+    def _reaches(self, source: int, target: int, *, slot_floor: Optional[int] = None) -> bool:
+        """Transitive reachability ``source -> target`` in the graph so far.
+
+        Backward BFS from ``target`` over ``deps`` (which carries every edge
+        class, including the producer/consumer wiring of a ``TransferOp``), so
+        R3 sees exactly the graph INTERFACES §4.3 describes: R1 + R2 + the R3
+        edges already added. Early-exits on a hit.
+
+        ``slot_floor`` prunes the walk to nodes whose schedule slot is ``>=`` the
+        floor. It is an EXACT optimization, not an approximation, and it is only
+        sound because every edge in the R1+R2+R3 graph is slot-monotone
+        (``order[0]`` of a dep ``<=`` ``order[0]`` of its node) — R1 is
+        intra-chain (same slot), R2 runs layer ``L -> L+1`` in schedule order,
+        and R3's own edges come from ``Schedule.implied_deps``, whose contract is
+        a monotone slot sequence. Any path ``source -> ... -> target`` therefore
+        has slots in ``[slot(source), slot(target)]``, so a node below the floor
+        can neither BE ``source`` nor lead back to it. ``_apply_r3`` VERIFIES the
+        invariant rather than assuming it (**D2**).
+
+        Without the floor a microbatch-boundary query — the "not implied" answer,
+        which is the one R3 actually has to add an edge for — costs a walk of the
+        whole ancestor set, and R3 asks ``O(devices x slots)`` of them. That is
+        quadratic in the schedule length: at ``pp=64, L=128, mb=512`` (GPT 1T)
+        it was ~65k full-graph walks over a ~130k-node DAG, measured at over two
+        CPU-hours in ``_apply_r3`` alone. With the floor each query is bounded by
+        the work between the two slots.
+        """
+        if source == target:
+            return True
+        nodes = self._nodes
+        orders = self._orders
+        stack = [target]
+        seen: Set[int] = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for dep in nodes[current].deps:
+                if dep == source:
+                    return True
+                if dep in seen:
+                    continue
+                if slot_floor is not None and orders[dep][0] < slot_floor:
+                    continue
+                stack.append(dep)
+        return False
+
+    def _reaches_forward(self, source: int, target: int) -> bool:
+        """Transitive reachability ``source -> target``, walking SUCCESSORS.
+
+        The mirror of :meth:`_reaches`, for callers whose SOURCE has the small
+        cone: "does this gradient reducer already reach the optimizer" walks
+        the reducer's descendants (a sink's cone is empty; a ZeRO-2 reducer's
+        is its gather chain) instead of the optimizer's ancestors (essentially
+        the device's whole history — the 152 s of GPT 1T's R5). Exact over
+        every edge class, no slot bound: successors are maintained by
+        ``_add_dep``/``_drop_dep`` for all of R1-R5.
+        """
+        if source == target:
+            return True
+        succs = self._succs
+        stack = [source]
+        seen: Set[int] = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for succ in succs[current]:
+                if succ == target:
+                    return True
+                if succ not in seen:
+                    stack.append(succ)
+        return False
+
+    # ------------------------------------------------------------------
+    # phase 4/5 — expansion (R1)
+    # ------------------------------------------------------------------
+    def _expand_all(self) -> None:
+        """L2 expansion + **R1**: within one chain, ``steps[i]`` depends on the
+        local indices ``steps[i].deps`` declare (the chain shape comes from the
+        ``BlockTemplate`` and HONORS ``CommSpec.placement`` — INTERFACES §3.4)."""
+        expander = BlockExpander(
+            self._fw, self._placement, overlap=self._overlap, routing=self._routing
+        )
+        for slot in self._schedule.ordered_slots:
+            work = slot.work
+            chains = expander.expand(work)
+            self._chains[work] = chains
+            for chain in chains:
+                device = int(chain.device)
+                if (work, device) in self._chain_nodes:
+                    raise BuildError(
+                        f"{work!r} expanded twice onto device {device}; "
+                        "Placement.devices_for must be injective on "
+                        "(WorkItem, cluster_rank) (P5)"
+                    )
+                self._chain_by_device[(work, device)] = chain
+                self._chain_nodes[(work, device)] = self._materialize_chain(work, chain)
+
+    def _materialize_chain(self, work: WorkItem, chain: ExpandedChain) -> List[int]:
+        """One proto node per chain step.
+
+        This is the hottest loop of a FLAT build (1.2M steps on GPT 175B), so
+        the per-WORK invariants — the schedule slot, the device position, the
+        IR direction, the MoE flag, the kind role — are resolved ONCE here
+        instead of per step (perf pass, 2026-08-02; this loop reproduces the
+        former ``_add_compute_step`` and per-step ``_order`` exactly —
+        ``ComputeStep.duration``/``recompute``/``param_gather`` are already
+        their declared types, so the ``float()``/``bool()`` re-wraps were
+        identity).
+        """
+        device = int(chain.device)
+        slot = self._schedule.index_of(work)
+        position = self._device_pos.get(device)
+        if position is None:
+            raise BuildError(
+                f"device {device} is not one of placement.devices() {self._devices}"
+            )
+        direction = (
+            IRDirection.FORWARD
+            if work.direction is Direction.FORWARD
+            else IRDirection.BACKWARD
+        )
+        kind_role = _ROLE_BY_KIND[work.kind]
+        is_moe = bool(
+            work.layer is not None and self._fw.spec.is_moe_layer(work.layer)
+        )
+        # GEMM steps are SHARED across microbatches and carry only the name
+        # PREFIX; the per-instance tail lives on the chain (perf pass 3).
+        suffix = chain.name_suffix
+        nodes = self._nodes
+        orders = self._orders
+        succs = self._succs
+        entry_names = self._entry_names
+        microbatch = work.microbatch
+        layer = work.layer
+        compute_new = ComputeOp.__new__
+        nids: List[int] = []
+        for step in chain.steps:
+            order = (slot, position, _PHASE_CHAIN, step.index, 0)
+            if isinstance(step, ComputeStep):
+                entry_name = step.entry_name
+                role = (
+                    OpRole.JOIN
+                    if step.kind is StepKind.JOIN
+                    else (OpRole.GEMM if entry_name is not None else kind_role)
+                )
+                nid = len(nodes)
+                # ``__new__`` + attribute sets: the dataclass kwargs ``__init__``
+                # measures 0.62 us against 0.21 us for this form (perf pass 5),
+                # and this is the single hottest allocation site of a FLAT
+                # build. Field-for-field identical to the ComputeOp(...) call
+                # it replaces.
+                op = compute_new(ComputeOp)
+                op.uid = nid
+                op.name = step.name + suffix if entry_name is not None else step.name
+                op.device = device
+                op.duration = (step.duration,)
+                op.deps = []  # LIST during the build; _finish retypes
+                op.role = role
+                op.direction = direction
+                op.mem_kind = step.mem_kind
+                op.recompute = step.recompute
+                op.param_gather = step.param_gather
+                op.micro_batch = microbatch
+                op.layer = layer
+                op.is_moe_layer = is_moe
+                op.work = work
+                nodes.append(op)
+                orders.append(order)
+                succs.append([])
+                entry_names.append(entry_name)
+                nids.append(nid)
+            elif isinstance(step, CommStep):
+                # ``nids`` is the IN-PROGRESS prefix of this chain: a comm step's
+                # local dep indices always point BEHIND it, so the prefix is
+                # enough and no second pass is needed.
+                nids.append(self._add_comm_step(work, chain, step, order, nids))
+            else:  # pragma: no cover - ChainStep is a closed union
+                raise BuildError(f"Unsupported chain step {step!r}")
+        # R1: local dep indices -> node ids. ``_add_dep`` is inlined here
+        # (same idempotence via the edge set; R1 edges are DATA_FLOW so the
+        # sparse class dict is untouched) — this loop runs once per chain-step
+        # dependency of the whole build.
+        edges = self._edges
+        recorder = self._edge_recorder
+        for step, nid in zip(chain.steps, nids):
+            node_deps = nodes[nid].deps
+            for local in step.deps:
+                dep_nid = nids[local]
+                key = (dep_nid, nid)
+                if key not in edges:
+                    edges.add(key)
+                    node_deps.append(dep_nid)
+                    succs[dep_nid].append(nid)
+                    if recorder is not None:  # pragma: no cover - R4-only
+                        recorder.append(key)
+                # A chain step that depends on a block-template p2p is a
+                # CONSUMER of it: the emitter has no ET node for the transfer
+                # itself, it wires the SEND id (src side) or RECV id (dst side)
+                # into the consumers. Without this the MoE cold-rank JOIN would
+                # lose its ordering against its own residual send.
+                dep_node = nodes[dep_nid]
+                if isinstance(dep_node, TransferOp) and nid not in dep_node.consumers:
+                    dep_node.consumers.append(nid)
+        # The MoE hot/cold join: a step of a SIBLING chain that additionally
+        # depends on this one (``block_program.py:366-373``). The referenced
+        # chain is always already built — the hot device is ``min(members)`` and
+        # devices are expanded ascending, which is invariant P4.
+        for step, nid in zip(chain.steps, nids):
+            if not isinstance(step, CommStep):
+                continue
+            for ref in step.extra_consumers:
+                target = self._chain_step_nid(work, int(ref.device), ref.index)
+                self._link_extra_consumer(nid, target)
+        return nids
+
+    def _chain_step_nid(self, work: WorkItem, device: int, index: int) -> int:
+        nids = self._chain_nodes.get((work, device))
+        if nids is None:
+            raise BuildError(
+                f"{work!r} has no expansion on device {device}; a StepRef must "
+                "point at a sibling chain of the same expansion (P4: the hot "
+                "rank is min(members) and expands first)"
+            )
+        return nids[index]
+
+    def _link_extra_consumer(self, nid: int, target: int) -> None:
+        node = self._nodes[nid]
+        if isinstance(node, TransferOp):
+            node.consumers.append(target)
+            src_device = int(node.src_device)
+        else:
+            src_device = int(node.device)
+        if src_device != int(self._nodes[target].device):
+            # A stage-0-delta cross-RANK edge (the MoE cold->hot join wiring):
+            # poisons the window certificate's monotonicity argument, so its
+            # presence forces the exact full walk.
+            self._cross_slots_other.append(self._orders[nid][0])
+        self._add_dep(nid, target, DepClass.DATA_FLOW)
+
+    def _add_comm_step(
+        self,
+        work: WorkItem,
+        chain: ExpandedChain,
+        step: CommStep,
+        order: _OrderKey,
+        prefix: Sequence[int],
+    ) -> int:
+        spec = step.spec
+        device = int(chain.device)
+        if spec.kind is CollectiveType.PIPELINE:
+            # A block-template p2p (the MoE ``residual_p2p``). ONE object, one
+            # identity: its destination is the sibling step it feeds.
+            dst = device
+            for ref in step.extra_consumers:
+                dst = int(ref.device)
+                break
+            producer = prefix[step.deps[0]] if step.deps else -1
+            if producer < 0:
+                raise BuildError(
+                    f"block-template transfer {spec.key!r} has no producer step"
+                )
+            nid = self._add_op(
+                TransferOp(
+                    uid=self._next_nid(),
+                    # Endpoints in the name: a block-template p2p key is
+                    # instantiated once per (src, dst) pair, and the emitter
+                    # derives the ET node name from this one. Diagnostics only —
+                    # names are not part of canonical equivalence — but without
+                    # it two distinct sends on one rank read identically.
+                    name=f"{spec.key}_rank{device}_to_rank{dst}",
+                    src_device=device,
+                    dst_device=dst,
+                    # int() here is the truncation the old second construction
+                    # applied at _finish; TransferOp.size_bytes is an int.
+                    size_bytes=int(spec.size_bytes),
+                    comm_type=spec.kind,
+                    producer=producer,
+                    deps=[],  # LIST during the build; _finish retypes
+                    consumers=[],
+                    moe_component=spec.moe_component,
+                    participants=int(spec.participants),
+                    interconnect=canonical_axis_label(spec.axes) if spec.axes else None,
+                ),
+                order,
+            )
+            if dst != device:
+                self._cross_slots_other.append(order[0])
+            self._add_dep(producer, nid, DepClass.DATA_FLOW)
+            return nid
+
+        # BUG_LEDGER 19 — ``in``, not ``==``: a dp x cp gradient reducer still
+        # takes the dp path (no GroupKey; replicated at emission), and the
+        # emitter widens its communicator over the cp siblings named in ``axes``.
+        is_dp = "dp" in tuple(spec.axes)
+        group = (
+            None
+            if is_dp
+            else self._placement.communicators.for_spec(spec, DeviceId(device))
+        )
+        axes = tuple(spec.axes)
+        nid = self._add_op(
+            CollectiveOp(
+                uid=self._next_nid(),
+                name=spec.key,
+                device=device,
+                coll=spec.kind,
+                size_bytes=float(spec.size_bytes),
+                participants=int(spec.participants),
+                interconnect=_pricing_axis(axes),
+                is_dp=is_dp,
+                label=None,  # assigned in uid order at _finish
+                group=group,
+                deps=[],  # LIST during the build; _finish retypes
+                comm_key=spec.key,
+                axes=axes,
+                work=work,
+            ),
+            order,
+        )
+        if step.overlap is not None:
+            producer = None
+            for local in step.deps:
+                candidate = prefix[local]
+                if isinstance(self._nodes[candidate], ComputeOp):
+                    producer = candidate
+            self._overlap_sites.append((nid, step.overlap, producer))
+        return nid
+
+    # ------------------------------------------------------------------
+    # phase 5b — R2 (cross-layer data flow)
+    # ------------------------------------------------------------------
+    def _cross_layer_size(self) -> float:
+        """``ByteSource("cross_layer", CEIL_DIV_CLUSTER).bytes_for(fw, shards)``
+        with ``shards = placement.activation_shard_size()`` — 1 at PIPELINE (raw
+        bytes, ``pipeline_coarse.py:222,238``), ``tp*cp`` at FLAT/BLOCK (divided,
+        ``pipeline_fine.py:645``). B3's amendment is what lets ONE rule reproduce
+        both.
+
+        The divisor is a **shard count, not a device count** (BUG_LEDGER D 10c,
+        ep half, fixed 2026-07-27). Legacy passed ``par_degree = tp*cp*ep``
+        (``git show 85894c6:llm_execution.py:369,822``) and the rewrite carried
+        it over as ``cluster_size()``. But the raw value
+        (``train_timing.py:2893-2902``) is ``activations * micro_batch * hidden *
+        seq`` and ``micro_batch`` is ALREADY ``batch/(dp*ep*mb)``
+        (``base_timing.py:490-495``), i.e. one EP owner's own microbatch. EP
+        ranks own DISTINCT tokens, so ``/ep`` divided a value that already
+        carried the ``/ep``. Measured at ``tp=cp=1`` (no confound): fixed global
+        batch 16, ``ep 1->2->4`` moved the per-dp-replica boundary aggregate
+        16,777,216 -> 8,388,608 -> 4,194,304 B, a conserved quantity scaling
+        ``1/ep``, while ``memory_estimation``'s per-device residual for the SAME
+        tensor stayed ``raw/(tp*cp)``."""
+        if self._cross_layer_bytes is None:
+            if CROSS_LAYER_KEY not in self._fw.spec.comm:
+                raise BuildError(
+                    f"Comm key {CROSS_LAYER_KEY!r} is required for a cross-device "
+                    "data-flow edge but is not declared in WorkloadSpec.comm "
+                    f"(declared: {sorted(self._fw.spec.comm)})"
+                )
+            self._cross_layer_bytes = ByteSource(
+                key=CROSS_LAYER_KEY, split=ByteSplit.CEIL_DIV_CLUSTER
+            ).bytes_for(self._fw, self._placement.activation_shard_size())
+        return self._cross_layer_bytes
+
+    def _cross_layer_spec(self):
+        """The ``cross_layer`` :class:`~program.workload.CommSpec`.
+
+        R2 needs three things off it: the byte count (``_cross_layer_size``) and
+        — so the analytical evaluator can time the p2p from the OP rather than
+        re-deriving it from a name — the analytical participant count and the
+        interconnect axis key (INTERFACES §4.7 amendment 2026-07-28).
+        """
+        return self._fw.spec.comm.require(CROSS_LAYER_KEY)
+
+    def _apply_r2(self) -> None:
+        """**R2** — the microbatch's data-flow order, forward and backward.
+
+        Forward: ``EMBEDDING -> LAYER 0 ... LAYER L-1 -> SOFTMAX``. Backward: the
+        mirror image, where a layer's ENTRY is its ``RECOMPUTE`` chain when one
+        exists (``_bwd_entry_node``, ``schedule.py:682-687``) — and the
+        ``RECOMPUTE -> LAYER/BACKWARD`` link inside one layer is a PLAIN
+        same-device dep, because the rematerialized activation never leaves the
+        device that recomputed it (legacy wires it as a direct
+        ``recompute_node.add_child(transformer_node_b)``, ``schedule.py:750``).
+
+        **AMENDMENT 2026-07-29.** R2 also links the two ends of a microbatch:
+
+        * ``SOFTMAX/FORWARD(b) -> SOFTMAX/BACKWARD(b)`` — the loss gradient
+          needs the forward logits. Legacy never wired it and the new core did
+          not either: the ordering was carried ONLY by R3, i.e. by whatever
+          adjacency the ``SchedulePolicy`` happened to produce, and R3 is free
+          to drop an edge it finds transitively implied (``:995``). Under GPipe
+          it survives; under any schedule that interleaves forward and backward
+          it is one adjacency away from being lost silently. It is a DATA_FLOW
+          edge, so it is stated as one.
+        * ``LAYER/FORWARD(b,l) -> RECOMPUTE(b,l)`` — the rematerialization
+          replays the forward of the same layer and needs what that forward
+          stashed. Same argument, same fix.
+
+        Both are same-stage by construction (a microbatch's softmax lives on
+        stage ``pp-1`` in both directions; a layer's recompute lives with the
+        layer), so both are plain same-device deps and neither adds an op.
+        """
+        work = self._work
+        shape = self._fw.spec.shape
+        layers = int(shape.num_layers)
+        for b in range(int(shape.micro_batches)):
+            forward = [work.get(WorkKind.EMBEDDING, Direction.FORWARD, microbatch=b)]
+            forward.extend(
+                work.get(WorkKind.LAYER, Direction.FORWARD, microbatch=b, layer=layer)
+                for layer in range(layers)
+            )
+            forward.append(work.get(WorkKind.SOFTMAX, Direction.FORWARD, microbatch=b))
+            sequence = [item for item in forward if item is not None]
+            for producer, consumer in zip(sequence, sequence[1:]):
+                self._link(producer, consumer, transfer=True)
+
+            if not self._fw.spec.run.include_backward:
+                continue
+
+            previous = work.get(WorkKind.SOFTMAX, Direction.BACKWARD, microbatch=b)
+            softmax_f = work.get(WorkKind.SOFTMAX, Direction.FORWARD, microbatch=b)
+            if softmax_f is not None and previous is not None:
+                self._link(softmax_f, previous, transfer=False)
+            for layer in reversed(range(layers)):
+                backward = work.get(
+                    WorkKind.LAYER, Direction.BACKWARD, microbatch=b, layer=layer
+                )
+                if backward is None:
+                    continue
+                remat = work.get(
+                    WorkKind.RECOMPUTE, Direction.FORWARD, microbatch=b, layer=layer
+                )
+                entry = remat if remat is not None else backward
+                if previous is not None:
+                    self._link(previous, entry, transfer=True)
+                if remat is not None:
+                    layer_f = work.get(
+                        WorkKind.LAYER, Direction.FORWARD, microbatch=b, layer=layer
+                    )
+                    if layer_f is not None:
+                        self._link(layer_f, remat, transfer=False)
+                    self._link(remat, backward, transfer=False)
+                previous = backward
+            embedding_b = work.get(
+                WorkKind.EMBEDDING, Direction.BACKWARD, microbatch=b
+            )
+            if previous is not None and embedding_b is not None:
+                self._link(previous, embedding_b, transfer=True)
+
+    def _link(self, producer: WorkItem, consumer: WorkItem, *, transfer: bool) -> None:
+        """Pair the producer's chains with the consumer's and link each pair.
+
+        Pairing is by cluster rank (``pipeline_fine.py:659-694``: ``r -> r``).
+        When one side is pinned to a single device (embedding, softmax — Class B
+        10d) that one chain pairs with every chain of the other side, which is
+        exactly what legacy does by giving one edge many children / many
+        per-rank edges one child.
+        """
+        producers = self._chains[producer]
+        consumers = self._chains[consumer]
+        # THE BYTE DECISION IS PER STAGE, NOT PER DEVICE. ``cross_layer`` models
+        # PIPELINE activation movement, so a link inside one stage carries no
+        # payload however many devices the stage has: legacy decides it at the
+        # coarse level with ``prev_node.hw_id == curr_node.hw_id`` (hw_id IS the
+        # stage — ``schedule.py:628``, ``:639``, ``:648``, ``:755``, ``:763``,
+        # ``:771``) and the FLAT expansion inherits the zero-byte control edge.
+        # Keying it on the DEVICE instead would invent a cross-tp-rank
+        # ``cross_layer`` payload for every embedding -> layer 0 link.
+        size = (
+            0.0
+            if self._placement.same_stage(producer, consumer)
+            else self._cross_layer_size()
+        )
+        for prod, cons in _pair(producers, consumers, producer, consumer):
+            src = int(prod.device)
+            dst = int(cons.device)
+            producer_nid = self._chain_nodes[(producer, src)][prod.exit]
+            consumer_nid = self._chain_nodes[(consumer, dst)][cons.entry]
+            if not transfer:
+                if src != dst:
+                    raise BuildError(
+                        f"{producer!r} -> {consumer!r} is a same-device data-flow "
+                        f"link but the chains are on {src} and {dst}"
+                    )
+                self._add_dep(producer_nid, consumer_nid, DepClass.DATA_FLOW)
+                continue
+            self._emit_cross_layer(producer, prod, producer_nid, cons, consumer_nid, size)
+
+    def _emit_cross_layer(
+        self,
+        producer: WorkItem,
+        prod: ExpandedChain,
+        producer_nid: int,
+        cons: ExpandedChain,
+        consumer_nid: int,
+        size: float,
+    ) -> None:
+        # A same-device link is still an OP, not a bare dep: Class B item 9 says
+        # the presence of the zero-byte same-stage PIPELINE event is load-bearing
+        # for the analytical evaluator's ready-scan, so it is emitted as a
+        # same-device TransferOp exactly as today (INTERFACES §4.3 R2).
+        src = int(prod.device)
+        dst = int(cons.device)
+        order = self._order(producer, src, _PHASE_XFER, self._xfer_seq)
+        self._xfer_seq += 1
+        spec = self._cross_layer_spec()
+        nid = self._add_op(
+            TransferOp(
+                uid=self._next_nid(),
+                name=CROSS_LAYER_KEY,
+                src_device=src,
+                dst_device=dst,
+                size_bytes=int(size),  # the truncation _finish used to apply
+                comm_type=CollectiveType.PIPELINE,
+                producer=producer_nid,
+                deps=[],  # LIST during the build; _finish retypes
+                consumers=[consumer_nid],
+                participants=int(spec.participants),
+                interconnect=canonical_axis_label(spec.axes) if spec.axes else None,
+            ),
+            order,
+        )
+        if src != dst:
+            # RECOMPUTE items carry Direction.FORWARD, so a cross transfer
+            # between recompute chains lands in the fwd list even though it
+            # runs in the backward phase — that can only make a window read
+            # MIXED and fall back to the exact full walk, never mis-certify.
+            (
+                self._cross_slots_fwd
+                if producer.direction is Direction.FORWARD
+                else self._cross_slots_bwd
+            ).append(order[0])
+        self._add_dep(producer_nid, nid, DepClass.DATA_FLOW)
+        # The compute-anchor double-dep (``pipeline_fine.py:672-687``): the SEND
+        # must fire off the last COMPUTE, not off a trailing collective.
+        anchor = self._nearest_compute(prod, producer_nid)
+        if anchor is not None and anchor != producer_nid:
+            self._add_dep(anchor, nid, DepClass.DATA_FLOW)
+        self._add_dep(nid, consumer_nid, DepClass.DATA_FLOW)
+
+    def _nearest_compute(self, chain: ExpandedChain, exit_nid: int) -> Optional[int]:
+        if isinstance(self._nodes[exit_nid], ComputeOp):
+            return None
+        nids = self._chain_nodes[(chain.work, int(chain.device))]
+        for index in range(chain.exit, -1, -1):
+            if isinstance(self._nodes[nids[index]], ComputeOp):
+                return nids[index]
+        return None
+
+    # ------------------------------------------------------------------
+    # phase 6 — R3 (device serialization)
+    # ------------------------------------------------------------------
+    def _apply_r3(self) -> None:
+        """**R3** — one edge per adjacent pair of a device's projection, added
+        ONLY when the pair is not already transitively implied.
+
+        Redundancy elimination is the point (**D1**): consecutive layers of one
+        microbatch on one device are already chained by R2, so ``reaches`` is
+        True and nothing is added — reproducing legacy, which only ever wires
+        the MICROBATCH BOUNDARY. Blanket serialization would inflate the DAG
+        with edges AstraSim then has to carry per rank.
+
+        **D2 — the slot-monotone precondition.** Every reachability query is
+        bounded below by ``slot(source)``; see :meth:`_reaches`. The invariant
+        that makes that exact is CHECKED here, once, in ``O(E)``, rather than
+        assumed: a violation would let a query answer "not implied" when it is,
+        which adds a redundant SCHEDULE edge and silently changes the emitted
+        DAG. Nothing downstream would catch it except a golden diff.
+        """
+        nodes = self._nodes
+        orders = self._orders
+        # The window certificate's indices (perf pass 4): sorted once; R3 only
+        # ever ADDS same-device edges, so they stay valid for the whole pass.
+        self._cross_slots_fwd.sort()
+        self._cross_slots_bwd.sort()
+        self._cross_slots_other.sort()
+        for (dep_nid, node_nid) in self._edges:
+            if orders[dep_nid][0] > orders[node_nid][0]:
+                raise BuildError(
+                    "D2 violated before R3: edge "
+                    f"{nodes[dep_nid].name!r} (slot {orders[dep_nid][0]}) -> "
+                    f"{nodes[node_nid].name!r} (slot {orders[node_nid][0]}) "
+                    "runs backwards in schedule slots. R3's reachability bound "
+                    "assumes the R1+R2 graph is slot-monotone (see _reaches)."
+                )
+        for dep in self._schedule.implied_deps(self._placement.devices_for):
+            device = int(dep.device)
+            before = self._chain_nodes.get((dep.before, device))
+            after = self._chain_nodes.get((dep.after, device))
+            if before is None or after is None:  # pragma: no cover - projection
+                raise BuildError(
+                    f"ScheduleDep {dep.before!r} -> {dep.after!r} names device "
+                    f"{device}, which is not where both are placed"
+                )
+            source = before[self._chain_by_device[(dep.before, device)].exit]
+            target = after[self._chain_by_device[(dep.after, device)].entry]
+            floor = orders[source][0]
+            if orders[target][0] < floor:  # pragma: no cover - see D2
+                raise BuildError(
+                    "D2 violated by an implied_deps pair: "
+                    f"{dep.before!r} (slot {floor}) is scheduled AFTER "
+                    f"{dep.after!r} (slot {orders[target][0]}) on device "
+                    f"{device}; Schedule.implied_deps must return a monotone "
+                    "slot sequence."
+                )
+            if self._r3_implied(source, target, floor):
+                continue
+            self._add_dep(source, target, DepClass.SCHEDULE)
+
+    def _r3_implied(self, source: int, target: int, floor: int) -> bool:
+        """Is ``source -> target`` already implied, for R3's boundary query?
+
+        Answered in the direction whose cone is SMALL for the verdict being
+        proved (perf pass 2, 2026-08-02; identical truth value — both walks
+        decide reachability over the same R1+R2+R3-so-far edge set, which is
+        slot-monotone by D2, so bounding below by ``slot(source)`` and above by
+        ``slot(target)`` are the SAME window):
+
+        * the IMPLIED verdict is usually a direct R2 edge (consecutive layers
+          of one microbatch, chained same-device), which the one-hop scan of
+          ``target.deps`` finds immediately;
+        * the NOT-implied verdict — the microbatch boundary R3 exists to wire,
+          and the expensive case (the old backward walk exhausted the whole
+          slot window: 116 s of GPT 1T's 748 s) — is proved by exhausting the
+          FORWARD cone of ``source`` below ``slot(target)``, which is tiny: a
+          chain exit's descendants within the window are the next stage's few
+          chain steps, not the window's every ancestor.
+        """
+        nodes = self._nodes
+        orders = self._orders
+        if source in nodes[target].deps:
+            return True
+
+        # WINDOW CERTIFICATE (perf pass 4, 2026-08-02). If every cross-device
+        # edge whose slot falls in [floor, slot(target)] belongs to ONE phase
+        # direction — and none is a stage-0-delta MoE cross-rank edge — the
+        # window is stage-monotone: cross edges all step the same way, so the
+        # ancestor cone of any off-device node can never contain a node of the
+        # query's own device, and pruning off-device preds is EXACT. This is
+        # the checked replacement for the unprovable global no-round-trip
+        # assumption; mixed windows (the fwd/bwd turnaround) and MoE windows
+        # take the exact full walk below. The not-implied verdict — the one R3
+        # adds edges for, and the one whose full walk exhausted the whole slot
+        # window (~97 s of a GPT 1T build) — becomes O(one device's chains in
+        # the window).
+        ceiling = orders[target][0]
+        lo_f = bisect_left(self._cross_slots_fwd, floor)
+        hi_f = bisect_right(self._cross_slots_fwd, ceiling)
+        lo_b = bisect_left(self._cross_slots_bwd, floor)
+        hi_b = bisect_right(self._cross_slots_bwd, ceiling)
+        lo_o = bisect_left(self._cross_slots_other, floor)
+        hi_o = bisect_right(self._cross_slots_other, ceiling)
+        has_fwd = hi_f > lo_f
+        has_bwd = hi_b > lo_b
+        if not (hi_o > lo_o) and not (has_fwd and has_bwd):
+            device = nodes[target].device
+            stack = [target]
+            seen: Set[int] = set()
+            while stack:
+                current = stack.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                for dep in nodes[current].deps:
+                    if dep == source:
+                        return True
+                    if dep in seen:
+                        continue
+                    if orders[dep][0] < floor:
+                        continue
+                    dep_node = nodes[dep]
+                    dep_device = (
+                        dep_node.src_device
+                        if isinstance(dep_node, TransferOp)
+                        else dep_node.device
+                    )
+                    if dep_device != device:
+                        continue  # exact under the certificate (see above)
+                    stack.append(dep)
+            return False
+
+        # Budgeted backward probe: when the backward window is small — the
+        # common IMPLIED-via-short-path case at moderate scale — it decides in
+        # a few pops either way. Only when it exceeds the budget (the huge
+        # windows of a GPT-1T-scale build) does the forward cone take over.
+        floor_slot = floor
+        budget = 96
+        stack = [target]
+        seen: Set[int] = set()
+        decisive = True
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if len(seen) > budget:
+                decisive = False
+                break
+            for dep in nodes[current].deps:
+                if dep == source:
+                    return True
+                if dep in seen:
+                    continue
+                if orders[dep][0] < floor_slot:
+                    continue  # D2: a path from source cannot dip below its slot
+                stack.append(dep)
+        if decisive:
+            return False
+
+        succs = self._succs
+        stack = [source]
+        fseen: Set[int] = set()
+        while stack:
+            current = stack.pop()
+            if current in fseen:
+                continue
+            fseen.add(current)
+            for succ in succs[current]:
+                if succ == target:
+                    return True
+                if succ in fseen:
+                    continue
+                if orders[succ][0] > ceiling:
+                    continue  # D2: a path to target cannot pass above its slot
+                stack.append(succ)
+        return False
+
+    # ------------------------------------------------------------------
+    # phase 7 — requirements
+    # ------------------------------------------------------------------
+    def _collect_requirements(self) -> Tuple[SyncRequirement, ...]:
+        ctx = ShardingContext(
+            fw=self._fw,
+            work=self._work,
+            grad_accum=self._grad_accum,
+            stages=self._schedule.layers,
+            # A prefetch requirement names the work it prefetches FOR
+            # (``ShardingContext.next_after``); that is a question about the
+            # execution order, which L3 declares, so the order is handed over
+            # rather than re-derived from a microbatch index.
+            order=self._schedule.order(),
+        )
+        out: List[SyncRequirement] = list(self._sharding.workload_requirements(ctx))
+        for item in self._work:
+            out.extend(self._sharding.requirements(item, ctx))
+            if self._routing is not None:
+                out.extend(ep_sync_requirements(item, ctx))
+        # K1/K3: the policy set is order-independent, so the RESOLUTION order is
+        # declared here and nowhere else.
+        out.sort(key=self._sync_order.key)
+        return tuple(out)
+
+    # ------------------------------------------------------------------
+    # phase 8 — R4 (sync attach)
+    # ------------------------------------------------------------------
+    def _apply_r4(self, requirements: Sequence[SyncRequirement]) -> None:
+        resolved: Set[SyncKey] = set()
+        for rank, req in enumerate(requirements):
+            if req.mode is AttachMode.AFTER:
+                for anchor in req.anchors:
+                    if isinstance(anchor, SyncKey) and anchor not in resolved:
+                        # Makes the S3/S5/S10 chaining a CHECKABLE property
+                        # instead of a construction-order coincidence (§4.4).
+                        raise BuildError(
+                            f"SyncRequirement {req.key!r} is AFTER({anchor!r}), which "
+                            "is not strictly earlier in SyncOrder"
+                        )
+            devices = self._placement.devices_for_sync(req)
+            groups = self._placement.communicators.groups_for(req, self._placement)
+            if len(groups) != len(devices):  # pragma: no cover - defensive
+                raise BuildError(
+                    f"groups_for({req.key!r}) returned {len(groups)} entries for "
+                    f"{len(devices)} instance devices"
+                )
+            size = req.bytes.bytes_for(self._fw, len(devices))
+            instances: List[int] = []
+            for instance, (device, group) in enumerate(zip(devices, groups)):
+                attached = self._attach(req, rank, instance, int(device), group, size)
+                if attached is not None:
+                    instances.append(attached)
+            if instances:
+                self._sync_nodes[req.key] = instances
+                if req.is_reducer:
+                    self._reducer_keys.add(req.key)
+                if req.after_update:
+                    self._after_update_keys.add(req.key)
+                resolved.add(req.key)
+            else:
+                # INTERFACES §2.3 note 1: a requirement whose resolved anchor
+                # set is empty is DROPPED and materializes no op. Legacy consumes
+                # a legacy op id for it and produces an unreachable object the
+                # lowering never collects (divergence class C).
+                self._dropped_requirements.append(f"{req.key!r} ({req.origin})")
+
+    def _attach(
+        self,
+        req: SyncRequirement,
+        rank: int,
+        instance: int,
+        device: int,
+        group: Optional[GroupKey],
+        size: float,
+    ) -> Optional[int]:
+        """Materialize ONE instance of ``req`` on ``device`` and attach it.
+
+        Returns the node id, or ``None`` when the anchors resolved to nothing.
+        """
+        anchors = [self._resolve_anchor(anchor, device) for anchor in req.anchors]
+        anchors = [pair for pair in anchors if pair[0] or pair[1]]
+        if not anchors:
+            return None
+
+        axes = tuple(req.axes)
+        nid = self._add_op(
+            CollectiveOp(
+                uid=self._next_nid(),
+                name=self._sync_name(req, instance),
+                device=device,
+                coll=req.kind,
+                size_bytes=float(size),
+                participants=int(req.participants),
+                interconnect=_pricing_axis(axes),
+                is_dp=bool(req.is_dp),
+                label=None,  # assigned in uid order at _finish
+                group=group,
+                deps=[],  # LIST during the build; _finish retypes
+                comm_key=req.comm_key,
+                axes=axes,
+                work=req.place_on,
+            ),
+            self._order(req.place_on, device, _PHASE_SYNC, rank, instance),
+        )
+        mode = req.mode
+        for entries, exits in anchors:
+            if mode is AttachMode.BEFORE:
+                # deps(req) := deps(a); deps(a) += req. Degenerate when ``a`` is
+                # a root, and then ``req`` becomes the root (S1).
+                for entry in entries:
+                    for dep in list(self._nodes[entry].deps):
+                        self._add_dep(dep, nid, DepClass.SYNC)
+                        dep_node = self._nodes[dep]
+                        if (
+                            isinstance(dep_node, TransferOp)
+                            and int(dep_node.dst_device) == int(device)
+                            and nid not in dep_node.consumers
+                        ):
+                            # a p2p edge is carried by ``consumers`` (the RECV id
+                            # is wired there), not by a ctrl_dep
+                            dep_node.consumers.append(nid)
+                    self._add_dep(nid, entry, DepClass.SYNC)
+            elif mode is AttachMode.AFTER:
+                for exit_nid in exits:
+                    self._add_dep(exit_nid, nid, DepClass.SYNC)
+            elif mode is AttachMode.PARALLEL_TO:
+                # deps(req) += deps(a); for s in succ(a, via): deps(s) += req.
+                #
+                # A MULTI-ANCHOR PARALLEL_TO (rows S6/S14, §2.3 note 2) whose
+                # anchors are ordered by data flow could in principle close a
+                # cycle: `req` would inherit anchor 1's successors AND anchor 2's
+                # deps, and anchor 2's deps are downstream of anchor 1. It does
+                # not happen for either production row — both use
+                # VIA_NON_DATA_FLOW, whose successors are the NEXT microbatch's
+                # entry, which is never upstream of this microbatch's anchors —
+                # and if a future policy ever does, `_kahn` raises and names the
+                # stuck ops rather than emitting an unschedulable Program.
+                for entry in entries:
+                    for dep in list(self._nodes[entry].deps):
+                        self._add_dep(dep, nid, DepClass.SYNC)
+                        dep_node = self._nodes[dep]
+                        if (
+                            isinstance(dep_node, TransferOp)
+                            and int(dep_node.dst_device) == int(device)
+                            and nid not in dep_node.consumers
+                        ):
+                            # a p2p edge is carried by ``consumers`` (the RECV id
+                            # is wired there), not by a ctrl_dep
+                            dep_node.consumers.append(nid)
+                for exit_nid in exits:
+                    for succ in list(self._succs[exit_nid]):
+                        if succ == nid:
+                            continue
+                        if self._classes(exit_nid, succ) & req.via:
+                            self._add_dep(nid, succ, DepClass.SYNC)
+            elif mode is AttachMode.OVERLAP_WITH:  # pragma: no cover - unused
+                raise BuildError(
+                    "AttachMode.OVERLAP_WITH on a SyncRequirement is realized by "
+                    "the OverlapDecl (§4.5), not by an attach; no production "
+                    "policy declares it"
+                )
+            else:  # pragma: no cover - AttachMode is closed
+                from typing import assert_never
+
+                assert_never(mode)
+
+        # DECLARED consumers (amendment 2026-07-29, §2.2). Applied after the
+        # mode so a requirement whose "who waits for me" answer is knowable at
+        # declaration time does not have to be discovered through ``via`` — the
+        # gap that makes rows S6/S14 ride an R3 edge. Idempotent: under GPipe
+        # the ``via`` scan above already added exactly these edges.
+        for consumer in req.consumers:
+            consumer_entries, _consumer_exits = self._resolve_anchor(consumer, device)
+            if not consumer_entries:
+                raise BuildError(
+                    f"SyncRequirement {req.key!r} ({req.origin}) declares consumer "
+                    f"{consumer!r}, which has no chain reachable from device {device}"
+                )
+            for entry in consumer_entries:
+                if entry == nid:  # pragma: no cover - defensive
+                    continue
+                self._add_dep(nid, entry, DepClass.SYNC)
+        return nid
+
+    def _sync_name(self, req: SyncRequirement, instance: int) -> str:
+        """Diagnostic name. Names are NOT part of canonical equivalence
+        (``equiv/canonical.py:20-27``) and nothing dispatches on them."""
+        key = req.key
+        parts = [str(key.comm_key), key.phase.name.lower()]
+        if key.microbatch is not None:
+            parts.append(f"b{key.microbatch}")
+        if key.layer is not None:
+            parts.append(f"l{key.layer}")
+        if instance:
+            parts.append(f"rank{instance}")
+        return "_".join(parts)
+
+    def _resolve_anchor(
+        self, anchor: SyncAnchor, device: int
+    ) -> Tuple[List[int], List[int]]:
+        """``anchor -> (entry nodes, exit nodes)`` for one instance device.
+
+        A chain's ``entry``/``exit`` are the only handles R4 may reference
+        (INTERFACES §4.3 R1): ``deps(a)`` means the entry's deps and
+        ``succ(a)`` the exit's successors, because a coarse node's parents and
+        children become exactly those in a chain.
+
+        Preference is the anchor's chain ON ``device``; when the anchor is pinned
+        elsewhere (a ``PER_CLUSTER_RANK`` requirement hanging off a cluster-rank-0
+        kind — rows S7/S13) every chain of the anchor is used. That region is new
+        development with new goldens: legacy's ``_ensure_zero3_per_rank_edges``
+        gives its per-rank gathers no parents at all in the ``hw_ids`` mode
+        (``pipeline_fine.py:389-391``), i.e. it makes them graph roots.
+        """
+        if isinstance(anchor, SyncKey):
+            nodes = self._sync_nodes.get(anchor)
+            if not nodes:
+                return ([], [])
+            local = [nid for nid in nodes if self._nodes[nid].device == device]
+            chosen = local if local else list(nodes)
+            return (chosen, list(chosen))
+        chains = self._chains.get(anchor)
+        if not chains:
+            return ([], [])
+        local_chains = [chain for chain in chains if int(chain.device) == device]
+        chosen_chains = local_chains if local_chains else list(chains)
+        entries: List[int] = []
+        exits: List[int] = []
+        for chain in chosen_chains:
+            nids = self._chain_nodes[(anchor, int(chain.device))]
+            entries.append(nids[chain.entry])
+            exits.append(nids[chain.exit])
+        return (entries, exits)
+
+    # ------------------------------------------------------------------
+    # phase 8b — R5 (the optimizer's gradient dependency)
+    # ------------------------------------------------------------------
+    def _apply_r5(self) -> None:
+        """**R5** (new, 2026-07-29) — ``OPTIMIZER(stage s)`` runs after EVERY
+        gradient-producing backward item of stage ``s``, on each device it is
+        placed on.
+
+        Stated because nothing stated it. Legacy hand-picked ONE attach point
+        per stage (``simulate_train_graph.py:1300-1318``: ``embedding_node_b[0]``
+        on stage 0, ``_bwd_exit_node(0, min_layer(s))`` elsewhere) and the new
+        core did not port it — the ordering came out of R3's per-device
+        adjacency, which happens to end each stage's projection with exactly
+        that item **because GPipe walks microbatches in reverse**. A schedule
+        whose backward walks microbatches ASCENDING leaves 6 of 9 backward items
+        un-ordered before the optimizer (measured), i.e. the optimizer applies
+        two thirds of a gradient. That is a property of the model, not of the
+        schedule, so it belongs in a rule.
+
+        Redundancy-eliminated exactly like R3 (**D1**): the edge is materialized
+        only when the ordering is not already implied, so under GPipe this rule
+        adds NOTHING and the artifact is unchanged. It runs AFTER R4 so the
+        sync lattice's own edges count as implications and so no ``via`` scan
+        can see an R5 edge.
+
+        **R5b** (2026-07-27, ledger item 11) — ``OPTIMIZER(stage s)`` ALSO runs
+        after every ``SyncPhase.GRAD`` collective of stage ``s`` on its own
+        device. Until this existed, every gradient reducer was a graph SINK
+        (measured: 6/6 dp collectives on ``dp2tp1cp1pp2``, 24/24 on
+        ``dp2tp2cp2pp2`` FLAT, at PIPELINE and FLAT alike), so AstraSim — one COMP
+        slot and one COMM slot per rank — issued the weight update CONCURRENTLY
+        with the all-reduce producing the gradients it applies. That is not a
+        modeling simplification; it is the one interleaving the hardware cannot
+        do, and it let 10b's optimizer duration hide entirely inside the dp
+        collective at ``dp > 1``.
+
+        Only the REDUCER is a source. ZeRO-2's post-reduce parameter all-gather
+        (``after_reducer``) is not: it is ``AFTER(reducer)`` and therefore still
+        parallel to the optimizer, which understates ZeRO-2 by one gather. Fixing
+        that means re-anchoring the gather on the optimizer (``reducer ->
+        optimizer -> gather``), which needs an anchor vocabulary for "the work
+        item's optimizer" that :class:`SyncAnchor` does not have. Left as ledger
+        item 14.
+        """
+        if not self._fw.spec.run.include_backward:
+            return
+        optimizers = [
+            item for item in self._work if item.kind is WorkKind.OPTIMIZER
+        ]
+        if not optimizers:
+            return
+        producers = [
+            item
+            for item in self._work
+            if item.direction is Direction.BACKWARD
+            and item.kind in _R5_GRADIENT_KINDS
+        ]
+        # R5b sources: the GRADIENT REDUCERS, indexed by (stage, device).
+        #
+        # Selected by ROLE (``SyncRequirement.is_reducer``), NOT by
+        # ``key.phase is SyncPhase.GRAD``. The phase test was wrong and shipped
+        # briefly: ZeRO-2's post-reduce parameter all-gather is declared in the
+        # same phase (``sharding.ZeRO2.after_reducer``), so it became an R5b
+        # source and the optimizer was ordered AFTER the gather —
+        # ``reduce-scatter -> all-gather -> update`` instead of the physical
+        # ``reduce-scatter -> update -> all-gather``. A phase says WHERE in the
+        # schedule a requirement sits; it can never answer WHAT it is.
+        #
+        # ``CollectiveOp.work`` is the requirement's ``place_on``, so the
+        # stage is read from the schedule exactly as it is for a work item —
+        # nothing is inferred from the node's name or comm key.
+        reducers: Dict[Tuple[int, int], List[int]] = {}
+        after_update: Dict[Tuple[int, int], List[int]] = {}
+        for key, nids in self._sync_nodes.items():
+            if key in self._reducer_keys:
+                bucket = reducers
+            elif key in self._after_update_keys:
+                bucket = after_update
+            else:
+                continue
+            for nid in nids:
+                node = self._nodes[nid]
+                work = getattr(node, "work", None)
+                if work is None:
+                    continue
+                bucket.setdefault(
+                    (int(self._schedule.stage_of(work)), int(node.device)), []
+                ).append(nid)
+
+        # ONE sort and ONE stage-partition of the producers, outside the loop.
+        # The body used to re-sort the FULL producer list once per optimizer
+        # CHAIN — at GPT 1T that is 512 chains x sorted(~131k items), 50 of the
+        # 51 s this rule still cost after the spine fix. Same iteration order:
+        # the stage filter commutes with the sort.
+        producers_by_stage: Dict[int, List[WorkItem]] = {}
+        for item in sorted(producers, key=WorkItem.sort_key):
+            producers_by_stage.setdefault(
+                int(self._schedule.stage_of(item)), []
+            ).append(item)
+        for optimizer in sorted(optimizers, key=WorkItem.sort_key):
+            stage = int(self._schedule.stage_of(optimizer))
+            for chain in self._chains.get(optimizer, ()):
+                device = int(chain.device)
+                target = self._chain_nodes[(optimizer, device)][chain.entry]
+                # NO ancestor walk for the producers (perf pass 2, 2026-08-02;
+                # the earlier "one grown set per target" version was measured at
+                # 152 s of GPT 1T's 748 s). "Does <producer exit> already reach
+                # <optimizer entry>" is answered by R3's OWN POSTCONDITION: R3
+                # processed EVERY adjacent pair of this device's projection
+                # (``Schedule.implied_deps``' contract) and either found the
+                # pair implied or added the SCHEDULE edge — so after R3 the
+                # device's slots form a connected serialization spine, and any
+                # same-device node at an EARLIER slot reaches any later one
+                # through it. A producer therefore needs an R5 edge only when
+                # its slot is AFTER the optimizer's — a schedule that runs the
+                # update before some backward item — and for that rare shape
+                # (no production schedule; zero cases under GPipe) the exact
+                # ``_reaches`` query is kept as the fallback. The spine argument
+                # needs only slot-monotone R1/R2/R3 edges to EXIST (D2-checked
+                # before R3); R4's later, possibly non-monotone sync edges can
+                # only ADD paths, never remove the spine.
+                target_slot = self._orders[target][0]
+                r5_sources: List[Tuple[WorkItem, int]] = []
+                for item in producers_by_stage.get(stage, ()):
+                    entry = self._chain_by_device.get((item, device))
+                    if entry is None:
+                        continue
+                    r5_sources.append(
+                        (item, self._chain_nodes[(item, device)][entry.exit])
+                    )
+                r5b_sources = sorted(reducers.get((stage, device), ()))
+                for _item, source in r5_sources:
+                    if source == target:
+                        continue
+                    if self._orders[source][0] < target_slot:
+                        continue  # implied via the R3 spine
+                    if self._reaches_forward(source, target):
+                        continue  # implied some other way (post-R4 edges)
+                    self._add_dep(source, target, DepClass.DATA_FLOW)
+                    self._r5_edges.append((source, target))
+                # R5b — the gradient the optimizer applies is the REDUCED one.
+                # A reducer hangs OFF the spine (a sync node, usually a sink),
+                # so its implication is genuinely unknown: the exact query, in
+                # the direction whose cone is small (the reducer's descendants,
+                # not the optimizer's ancestors). Sources per (stage, device)
+                # are few.
+                for source in r5b_sources:
+                    if source == target:
+                        continue
+                    if self._reaches_forward(source, target):
+                        continue
+                    if self._reaches_forward(target, source):
+                        raise BuildError(
+                            f"R5b would close a cycle: OPTIMIZER node {target} "
+                            f"already reaches its own gradient reducer {source} "
+                            f"(stage {stage}, device {device})"
+                        )
+                    self._add_dep(source, target, DepClass.DATA_FLOW)
+                    self._r5_edges.append((source, target))
+                # R5c — and anything that broadcasts the UPDATED parameters runs
+                # after it. Must land WITH R5b, never alone: excluding ZeRO-2's
+                # gather from R5b's sources without this makes the gather a
+                # graph SINK, and a sink collective overlaps the update for free
+                # — cheaper than the mis-ordered edge it replaced. Measured on
+                # `flattened:dp2tp1cp1pp2mb2sp0:zero2`: sink 0.09293931 s vs
+                # correct 0.09309056 s, against 0.09766584 s for the inverted
+                # ordering. Only the pair is right.
+                exit_nid = self._chain_nodes[(optimizer, device)][chain.exit]
+                # R5c asks the MIRROR question ("does the optimizer's exit reach
+                # this sink"), so it needs the sink's ancestors, not the
+                # target's. There are only a handful of post-update collectives
+                # per (stage, device) — unlike R5's producer list — so this side
+                # stays a direct query.
+                for sink in sorted(after_update.get((stage, device), ())):
+                    if sink == exit_nid or self._reaches(exit_nid, sink):
+                        continue
+                    if self._reaches(sink, exit_nid):
+                        raise BuildError(
+                            f"R5c would close a cycle: post-update collective "
+                            f"{sink} already reaches OPTIMIZER node {exit_nid} "
+                            f"(stage {stage}, device {device})"
+                        )
+                    self._add_dep(exit_nid, sink, DepClass.DATA_FLOW)
+                    self._r5_edges.append((exit_nid, sink))
+
+    # ------------------------------------------------------------------
+    # phase 9 — overlap realization (INTERFACES §4.5)
+    # ------------------------------------------------------------------
+    def _realize_overlap(self) -> None:
+        """Realize every :class:`OverlapDecl` a block-template ``CommStep``
+        carries.
+
+        Runs AFTER R4, which is where the legacy pipeline applies it (flatten ->
+        overlap -> propagate -> lower) and therefore after the whole ZeRO
+        lattice. Split ops get FRESH order keys; the ``head``/``_block``/``_ovlp``
+        op-id-reuse quirks (``transforms.py:200,255,267``) do not survive,
+        because program order is computed (§4.6) so duplicate ids cannot exist.
+
+        ``retime`` interaction: a per-DP duration profile cannot be split
+        (``transforms.py:468-478``), so overlap is realized here, before any
+        retime write-back can apply. ``retime`` operates on a BUILT Program and
+        is forbidden from running before ``build()`` returns.
+        """
+        # PRODUCER splits are grouped by the compute they split: one compute may
+        # feed several overlapped collectives (a MoE parallel post-group), and
+        # legacy splits the node once with all of them as ``tp_children``.
+        producer_sites: Dict[int, List[int]] = {}
+        producer_decl: Dict[int, OverlapDecl] = {}
+        for nid, decl, producer in self._overlap_sites:
+            if decl.anchor is OverlapAnchor.PRODUCER:
+                if producer is None:
+                    raise BuildError(
+                        f"OverlapDecl(PRODUCER) on {self._nodes[nid].name!r} has no "
+                        "producing ComputeStep in its chain"
+                    )
+                producer_sites.setdefault(producer, []).append(nid)
+                producer_decl[producer] = decl
+            else:
+                self._split_collective(nid, decl)
+        for producer in sorted(producer_sites):
+            self._split_compute(producer, producer_sites[producer], producer_decl[producer])
+
+    def _split_compute(
+        self, compute: int, collectives: Sequence[int], decl: OverlapDecl
+    ) -> None:
+        """``OverlapAnchor.PRODUCER`` (verbatim ``_split_tp_node_fine``)."""
+        node = self._nodes[compute]
+        if not isinstance(node, ComputeOp):  # pragma: no cover - defensive
+            raise BuildError("PRODUCER overlap must split a ComputeOp")
+        duration = float(node.duration[0])
+        if duration <= 0.0:
+            return
+
+        if decl.is_hoist:
+            # f >= 1: hoist — the collective takes the compute's deps and the
+            # compute takes the collective's consumers (``transforms.py:177-188``).
+            for coll in collectives:
+                for dep in list(self._nodes[compute].deps):
+                    self._reparent_dep(dep, coll, like=(dep, compute))
+                self._drop_dep(compute, coll)
+                for succ in list(self._succs[coll]):
+                    self._reparent_dep(compute, succ, like=(coll, succ))
+            return
+
+        head_duration = duration * (1.0 - decl.fraction)
+        tail_duration = duration * decl.fraction
+        if head_duration <= 0.0 or tail_duration <= 0.0:
+            return
+
+        # The ORIGINAL node stays the tail (legacy mutates it in place), so every
+        # successor keeps pointing at it and only the deps move.
+        slot, device_index, _, a, _ = self._orders[compute]
+        head = self._add_op(
+            ComputeOp(
+                uid=self._next_nid(),
+                name=f"{node.name}_head",
+                device=node.device,
+                duration=(head_duration,),
+                deps=[],  # LIST during the build; _finish retypes
+                role=node.role,
+                direction=node.direction,
+                mem_kind=node.mem_kind,
+                recompute=node.recompute,
+                param_gather=node.param_gather,
+                micro_batch=node.micro_batch,
+                layer=node.layer,
+                is_moe_layer=node.is_moe_layer,
+                work=node.work,
+            ),
+            (slot, device_index, _PHASE_CHAIN, a, -1),
+            entry_name=self._entry_names[compute],
+        )
+        node.duration = (tail_duration,)
+        for dep in list(node.deps):
+            for dep_class in self._classes(dep, compute):
+                self._add_dep(dep, head, dep_class)
+            # A transfer whose CONSUMER was this compute now feeds the head:
+            # the deps move, so the consumer wiring must move with them or the
+            # emitter would wire the RECV id into the tail while the dep graph
+            # says head (legacy did the same rewrite, transforms.py:_split_tp).
+            dep_node = self._nodes[dep]
+            if isinstance(dep_node, TransferOp):
+                dep_node.consumers = [
+                    head if consumer == compute else consumer
+                    for consumer in dep_node.consumers
+                ]
+            self._drop_dep(dep, compute)
+        self._add_dep(head, compute, DepClass.DATA_FLOW)
+        for coll in collectives:
+            self._reparent_dep(head, coll, like=(compute, coll))
+            self._drop_dep(compute, coll)
+            for succ in list(self._succs[coll]):
+                self._reparent_dep(compute, succ, like=(coll, succ))
+
+    def _split_collective(self, coll: int, decl: OverlapDecl) -> None:
+        """``OverlapAnchor.CONSUMER`` (verbatim ``_split_cp_edge_fine``)."""
+        node = self._nodes[coll]
+        if not isinstance(node, CollectiveOp):  # pragma: no cover - defensive
+            raise BuildError("CONSUMER overlap must split a CollectiveOp")
+        blocking = [
+            succ
+            for succ in self._succs[coll]
+            if self._is_blocking_consumer(succ, decl)
+        ]
+        if not blocking:
+            return
+        total = float(node.size_bytes)
+        block_bytes = math.ceil(total * (1.0 - decl.fraction))
+        ovlp_bytes = max(0.0, total - block_bytes)
+        preds = list(self._nodes[coll].deps)
+        succs = list(self._succs[coll])
+
+        if decl.is_hoist or total <= 0 or block_bytes <= 0:
+            # The blocking consumer is re-parented onto the collective's
+            # predecessors (``transforms.py:233-244``).
+            for consumer in blocking:
+                for pred in preds:
+                    self._reparent_dep(pred, consumer, like=(pred, coll))
+                self._drop_dep(coll, consumer)
+            for succ in succs:
+                if succ in blocking:
+                    continue
+                for consumer in blocking:
+                    self._reparent_dep(consumer, succ, like=(coll, succ))
+            return
+
+        node.size_bytes = float(block_bytes)
+        node.name = f"{node.name}_block"
+        ovlp: Optional[int] = None
+        if ovlp_bytes > 0:
+            slot, device_index, _, a, _ = self._orders[coll]
+            ovlp = self._add_op(
+                CollectiveOp(
+                    uid=self._next_nid(),
+                    name=f"{node.comm_key}_ovlp",
+                    device=node.device,
+                    coll=node.coll,
+                    size_bytes=float(ovlp_bytes),
+                    participants=node.participants,
+                    interconnect=_pricing_axis(node.axes),
+                    is_dp=node.is_dp,
+                    label=None,  # assigned in uid order at _finish
+                    group=node.group,
+                    deps=[],  # LIST during the build; _finish retypes
+                    comm_key=node.comm_key,
+                    axes=node.axes,
+                    work=node.work,
+                ),
+                (slot, device_index, _PHASE_CHAIN, a, 1),
+            )
+            self._add_dep(coll, ovlp, DepClass.DATA_FLOW)
+        for succ in succs:
+            if succ in blocking:
+                continue
+            carried = self._classes(coll, succ)
+            self._drop_dep(coll, succ)
+            for consumer in blocking:
+                for dep_class in carried:
+                    self._add_dep(consumer, succ, dep_class)
+            for dep_class in carried:
+                self._add_dep(coll if ovlp is None else ovlp, succ, dep_class)
+
+    def _is_blocking_consumer(self, nid: int, decl: OverlapDecl) -> bool:
+        node = self._nodes[nid]
+        if not isinstance(node, ComputeOp):
+            return False
+        target = decl.blocking_consumer
+        if target is None:  # pragma: no cover - OverlapDecl rejects it
+            return False
+        # Matched against ``ComputeStep.entry_name`` — a TYPED BlockTemplate
+        # field, not the op's display name (``transforms.py:224`` tests
+        # ``"attention" in name.lower()``) — and the needle is DATA on the
+        # policy, never a literal here. entry_name is builder-side (the IR
+        # deliberately does not carry it — P5 deleted ordering/template
+        # metadata from ops), hence the side array.
+        return target.lower() in str(self._entry_names[nid] or "").lower()
+
+    # ------------------------------------------------------------------
+    # phase 10 — program order, uids, Program
+    # ------------------------------------------------------------------
+    def _finish(self, *, validate: bool, check_group_membership: bool = False) -> Program:
+        uid_of = self._kahn()
+        # IN-PLACE renumber (perf pass 3, 2026-08-02): the ops ARE the final IR
+        # instances — there is no second construction. uids and dep/producer/
+        # consumer references go from build nids to program order, the
+        # build-time LISTS retype to the tuples the IR declares, and collective
+        # labels are interned in UID ORDER (the order the old loop assigned
+        # them in, so the ``name_N`` suffixes are unchanged).
+        nodes = self._nodes
+        ops: List[Op] = [None] * len(nodes)  # type: ignore[list-item]
+        for nid, op in enumerate(nodes):
+            uid = uid_of[nid]
+            op.uid = uid
+            op.deps = tuple([uid_of[dep] for dep in op.deps])
+            if isinstance(op, TransferOp):
+                op.producer = uid_of[op.producer]
+                op.consumers = tuple([uid_of[c] for c in op.consumers])
+            ops[uid] = op
+        groups: Dict[GroupKey, CommGroup] = {}
+        labels = _LabelInterner()
+        for op in ops:
+            if isinstance(op, CollectiveOp) and op.group is not None:
+                label = labels.label_for(op.comm_key or op.name, op.group)
+                op.label = label
+                groups.setdefault(op.group, CommGroup(key=op.group, label=label))
+
+        devices = tuple(int(device) for device in self._devices)
+        dp_count = (
+            int(self._dp_count_in)
+            if self._dp_count_in is not None
+            else int(self._fw.spec.run.retime_dp_count(self._fw.spec.degrees))
+        )
+        meta = ProgramMeta(
+            label=self._label,
+            misc={
+                "granularity": self._granularity.name.lower(),
+                "program_order": "kahn(slot,device,intra)",
+                "duration_revision": int(self._fw.durations.revision),
+                "num_stages_initial": len(devices),
+                "schedule_policy": self._schedule.policy,
+                "sync_order": self._sync_order.name,
+                "sharding_policy": self._sharding.name,
+                "grad_accum_policy": self._grad_accum.name,
+                "recompute_policy": self._recompute.name,
+                "overlap_policy": self._overlap.name,
+                "routing_policy": None if self._routing is None else self._routing.name,
+                "placement_policy": self._placement_policy.name,
+                "layer_assignment_contiguous": self._schedule.layers.contiguous_layers(),
+                "work_restricted": self._work_restricted,
+                "work_directions": (
+                    None
+                    if self._directions is None
+                    else tuple(d.name for d in self._directions)
+                ),
+                # **D1's artifact.** DERIVED from the edge table rather than
+                # recorded at R3 time: overlap realization (§4.5) re-parents
+                # edges after R3 runs, so a recorded ``(source, target)`` nid
+                # pair could name an edge that no longer exists (measured: 6/13
+                # stale on ``dp1tp2cp1pp2mb2sp1``, 14/25 on
+                # ``dp2tp2cp2pp2mb2sp1``). Reading the CLASS off the surviving
+                # edge cannot go stale, and it is what makes D1 checkable on the
+                # artifact instead of on a log line. Re-parenting preserves the
+                # class (``_reparent_dep``), which is what makes this exact.
+                # SCHEDULE-classed edges are never pure-DATA_FLOW, so the
+                # sparse class dict is exhaustive for this query.
+                "schedule_edges": tuple(
+                    sorted(
+                        (uid_of[source], uid_of[target])
+                        for (source, target), classes in self._edge_classes.items()
+                        if DepClass.SCHEDULE in classes
+                    )
+                ),
+                # R5/R5b edges (post-R3), so **D1** can be re-derived exactly:
+                # see ``_r5_edges``. Recorded as surviving edges only, for the
+                # same staleness reason as ``schedule_edges`` above.
+                "r5_edges": tuple(
+                    sorted(
+                        (uid_of[source], uid_of[target])
+                        for (source, target) in self._r5_edges
+                        if (source, target) in self._edges
+                    )
+                ),
+                # R4's sync attachments, also post-R3 — see ``_r4_edges``.
+                "r4_edges": tuple(
+                    sorted(
+                        (uid_of[source], uid_of[target])
+                        for (source, target) in self._r4_edges
+                        if (source, target) in self._edges
+                    )
+                ),
+                "dropped_requirements": tuple(self._dropped_requirements),
+                "gmap_workdir": self._gmap_workdir,
+            },
+        )
+        program = Program(
+            layout=self._placement.layout,
+            dp_count=max(1, dp_count),
+            devices=devices,
+            ops=ops,
+            groups=groups,
+            meta=meta,
+        )
+        if validate:
+            from program.validate import validate_program
+
+            # V6 is promoted to ALWAYS-ON here (INTERFACES §4.8): every legacy
+            # production caller passes check_races=False, so CONTEXT constraint 2
+            # is unenforced outside tests. V7 is opt-in — see build()'s docstring
+            # for why A2 makes it non-fatal until P7.
+            validate_program(
+                program,
+                check_races=True,
+                check_group_membership=check_group_membership,
+            )
+        return program
+
+    def _kahn(self) -> List[int]:
+        """Uids by Kahn's algorithm with a min-heap keyed on :meth:`_order`.
+
+        Total (keys are unique by construction), respects ``dep < uid`` (**V1**,
+        **O2**), schedule-major, and a pure function of the inputs (**O1**).
+
+        The heap carries a precomputed INTEGER RANK per node, not the
+        ``_OrderKey`` itself (perf pass, 2026-08-02): the keys are static and
+        unique, so ``rank(a) < rank(b) <=> order(a) < order(b)`` and the
+        popped sequence is IDENTICAL — but each of the O(V log V) heap
+        comparisons is an int compare instead of a nested-tuple compare, and
+        the one-time ranking is a single Timsort. ``nid`` is dense
+        (``_next_nid`` is ``len(self._nodes)``), so indegree/uid live in
+        lists. GPT 175B FLAT (~1.2M nodes): the ordering half of ``_finish``
+        drops from ~6 s to ~2 s. Returns a list indexed by nid.
+        """
+        nodes = self._nodes
+        orders = self._orders
+        succs_arr = self._succs
+        by_rank: List[int] = sorted(
+            range(len(nodes)), key=lambda nid: (orders[nid], nid)
+        )
+        rank_of: List[int] = [0] * len(nodes)
+        for rank, nid in enumerate(by_rank):
+            rank_of[nid] = rank
+        indegree: List[int] = [len(node.deps) for node in nodes]
+        heap: List[int] = [
+            rank_of[nid] for nid in range(len(nodes)) if indegree[nid] == 0
+        ]
+        heapq.heapify(heap)
+        uid_of: List[int] = [-1] * len(nodes)
+        assigned = 0
+        while heap:
+            nid = by_rank[heapq.heappop(heap)]
+            uid_of[nid] = assigned
+            assigned += 1
+            for succ in succs_arr[nid]:
+                indegree[succ] -= 1
+                if indegree[succ] == 0:
+                    heapq.heappush(heap, rank_of[succ])
+        if assigned != len(nodes):
+            stuck = [nid for nid in range(len(nodes)) if uid_of[nid] < 0][:8]
+            raise BuildError(
+                f"dependency cycle: {len(nodes) - assigned} ops never "
+                f"became ready (e.g. {[nodes[n].name for n in stuck]})"
+            )
+        return uid_of
+
+
+def _pair(
+    producers: Sequence[ExpandedChain],
+    consumers: Sequence[ExpandedChain],
+    producer_work: WorkItem,
+    consumer_work: WorkItem,
+) -> Tuple[Tuple[ExpandedChain, ExpandedChain], ...]:
+    """Cluster-rank pairing of two expansions.
+
+    Equal widths pair ``r -> r``; a width-1 side (a kind pinned to cluster rank
+    0 — Class B 10d) pairs with every chain of the other side. Any other
+    combination is a placement bug, not something to paper over.
+    """
+    if len(producers) == len(consumers):
+        return tuple(zip(producers, consumers))
+    if len(producers) == 1:
+        return tuple((producers[0], cons) for cons in consumers)
+    if len(consumers) == 1:
+        return tuple((prod, consumers[0]) for prod in producers)
+    raise BuildError(
+        f"cannot pair {len(producers)} chains of {producer_work!r} with "
+        f"{len(consumers)} chains of {consumer_work!r}"
+    )
+
+
+class _LabelInterner:
+    """``(base name, group) -> label``, with a ``name_N`` suffix per distinct
+    member set.
+
+    Same shape as ``legacy_lowering._assign_collective_labels_with_members``
+    (``:270-277``), assigned in uid order so it is a pure function of the
+    program order. The label is what the emitter interns wire gids by
+    (``et_emit.py:221-263``): one label must map to exactly one member set, and
+    that is guaranteed here because the member set is part of the key.
+    """
+
+    def __init__(self) -> None:
+        self._labels: Dict[Tuple[str, Tuple[int, ...]], str] = {}
+        self._suffix: Dict[str, int] = {}
+
+    def label_for(self, base: str, group: GroupKey) -> str:
+        key = (str(base), tuple(group.members))
+        label = self._labels.get(key)
+        if label is None:
+            count = self._suffix.get(str(base), 0)
+            label = str(base) if count == 0 else f"{base}_{count}"
+            self._suffix[str(base)] = count + 1
+            self._labels[key] = label
+        return label

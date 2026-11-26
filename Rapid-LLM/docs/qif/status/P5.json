@@ -1,0 +1,42 @@
+{
+ "plan": "P5",
+ "title": "The System Atlas",
+ "updated": "2026-08-24",
+ "deliverables": [
+  {
+   "id": "P5.1",
+   "title": "fws_atlas/1 schema + hand-written fixture (Llama2-7B tp=2 decode, ADJ-7)",
+   "status": "done",
+   "report": "docs/qif/atlas/SCHEMA.md freezes fws_atlas/1 (systems, chips, macros, tiles, links, metrics, relaxations, device cards, owner tuples, slice roles, groups, primary_group) plus the loader refusals and the fixture_invented convention. docs/qif/atlas/fixture_llama7b_tp2.json is a Llama2-7B tp=2 decode mapping: 8 chips (6 analog + 2 shared digital), 724 enumerated macro slots (720 analog + 4 shared-digital engine slots), 520 holding 648 tiles, 13 links. Capacities, per-array area (14.367386 mm2), 120 slots/chip, throughput and periods are recorded from run_perf.py on fws_cim_llama7b.yaml + llama2_7b_fws_inf.yaml; the tp=2 placement, tile split, column spans, DUTY CYCLES, digital-pool sizing and link bytes are hand-authored and marked (corrected: an earlier draft of this line also claimed duty cycles were recorded, which the fixture's own provenance contradicts). Assumptions I decided rather than escalating: (a) added link role 'act' for the chip-boundary handoff and the analog->shared-digital attention hop, because ADJ-5 forbids calling a chip boundary pp; (b) macros with no tiles must carry a 'reserved' string, which is how the named-owner invariant is enforced for reserved slots and for the digital fabric engines; (c) chips carry capacity.macro_slots, occupancy, groups and primary_group so the package view derives nothing; (d) the fixture's throughput/period figures are the tp=1 recording of the same model+hardware pair and that is disclosed as a relaxation, not buried in a footnote; (e) the shared digital chiplets show POOL MEMBERSHIP only — op residency needs P4's DAG and is phase 3, which the fixture's reserved strings already say (this closes plan-page open question 4); (f) plan-page open questions 1, 2, 3 and 5 are closed by ADJ-7 and the build conforms to all four.",
+   "questions": []
+  },
+  {
+   "id": "P5.2",
+   "title": "Phase-1 renderer: package/chip views, group hues, occupancy, hover, file-drop + embedded blob",
+   "status": "done",
+   "report": "docs/qif/atlas/atlas.html is one self-contained file - inline JS and SVG, no external asset, no network. Package view clusters chips by pool with links weighted by sqrt(bytes) and dashed by role; chip view draws the macro grid ordered by id, hue = parallelism group, occupancy as a single-hue fill ramp, dashed outline = shared digital chiplet, hatch = reserved or over-palette, plus a per-macro column strip. Data arrives three ways - the embedded blob (default, works off a USB stick), a sibling-file fetch over http, and file drop - and WAVE D made that fetch CONDITIONAL: it runs only when ?data= asks for a document or the file carries no embedded blob, so a deliberately embedded document is never replaced late by whatever else happens to sit in the directory, and a dropped or picked file still always wins. The four group hues pass the dataviz validator all-pairs on surface #f7f9fa (CVD dE 9.3 deutan, contrast >= 3:1).",
+   "questions": []
+  },
+  {
+   "id": "P5.3",
+   "title": "Loader conformance refusals + validation panel",
+   "status": "done",
+   "report": "29 loader rules: referential integrity in both directions, integer enumerated chips with any *_per_chip quotient refused by name, named owners, column spans inside capacity and non-overlapping, declared occupancy checked against the enumerated spans, one labeled accounting per metric, every relaxation carrying constraint/value/reason, and R28/R29 carrying those rules across a two-system PD document. Any error refuses to draw and prints rule + field path + what is wrong. The self-test corrupts a copy of the loaded document once per corruption: 36 corruptions, 37 self-test rows, each naming the right field, run headlessly in node by tests/test_qif_atlas.py (skipped when node is absent). ASSUMPTION: a corruption a document cannot construct reports n/a, not a miss.",
+   "questions": []
+  },
+  {
+   "id": "P5.4",
+   "title": "Duty cycle + PD two-system view (needs P3/P4)",
+   "status": "done",
+   "report": "Duty cycle got its own channel: a neutral-ink bar (#3d4f5c, never a group hue) on each macro's top edge and in the macro card, on the absolute 0-1 scale, with view rule V3 asserting it never moves the occupancy fill. docs/qif/atlas/pd_llama7b.json is a real PD pair (D16) from the new --pd path of tools/fws_emit_atlas.py, each half placed by P3 and priced by P4 on its OWN timeline, pinned by a regenerate-and-compare test. R28 and R29 carry the honesty rules across systems. ASSUMPTIONS: the duty scale stays absolute; the pair keeps model id 'llama'; disclosures now merge across systems; the unpriced --pd path discloses the whole-MODEL fact only, since an unpriced document lowers no request.",
+   "questions": []
+  },
+  {
+   "id": "P5.5",
+   "title": "Phase 2: drill-down with breadcrumbs, filters, owner search, macro column map with slice brackets",
+   "status": "done",
+   "report": "Phase 2 shipped in the one file: click-to-descend package -> chip -> macro with breadcrumbs, a Macro view drawing the column map with one bracket per owner tuple (D11), filters by model / layer / group / pool, an owner search over the owner vocabulary only, and deep links so a screenshot is one URL. Filters DIM and never remove, so no figure moves when a filter does. The toolbar prints the 10,000-RECT draw budget and what the view draws, now COUNTED in rects rather than macro slots (audit fix: the slot count undercounted by ~5x, so R23 and V4 tested the wrong quantity). Verified in node (tests/test_qif_atlas.py, 38 tests) and in browsers; the PD / duty / filter / self-test views were shot on chromium because playwright's Firefox build cannot launch on this host.",
+   "questions": []
+  }
+ ]
+}

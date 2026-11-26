@@ -1,0 +1,296 @@
+{
+ "astra_times": {
+  "flat": {
+   "max_sec": 0.033731124,
+   "per_rank_sec": [
+    0.025933062000000003,
+    0.025938062,
+    0.033301124,
+    0.033731124
+   ]
+  }
+ },
+ "bundles": {
+  "flat": {
+   "bundle_hash": "9caa842298774cc05b2dfb13e7cfefa4f4ff63d5aab772e3294f76963f72dd50",
+   "byte_hist_by_kind": {
+    "COLL": {
+     "2097152": 96,
+     "4194304": 96
+    },
+    "RECV": {
+     "1": 8,
+     "2097152": 8
+    },
+    "SEND": {
+     "1": 8,
+     "2097152": 8
+    }
+   },
+   "bytes_by_axis": {
+    "p2p": 33554448,
+    "tp": 603979776
+   },
+   "bytes_by_kind": {
+    "COLL": 603979776,
+    "RECV": 16777224,
+    "SEND": 16777224
+   },
+   "collectives_by_group": {
+    "0,1": {
+     "by_kind": {
+      "2": {
+       "bytes": 100663296,
+       "n": 48
+      },
+      "7": {
+       "bytes": 201326592,
+       "n": 48
+      }
+     },
+     "bytes": 301989888,
+     "n_ops": 96
+    },
+    "2,3": {
+     "by_kind": {
+      "2": {
+       "bytes": 100663296,
+       "n": 48
+      },
+      "7": {
+       "bytes": 201326592,
+       "n": 48
+      }
+     },
+     "bytes": 301989888,
+     "n_ops": 96
+    }
+   },
+   "comm_groups": {
+    "1000": [
+     2,
+     3
+    ],
+    "1001": [
+     0,
+     1
+    ]
+   },
+   "compute_micros_total": 85088,
+   "manifest": {
+    "npus": 4,
+    "ranks": {
+     "0": {
+      "COMM:2:2097152:null": 24,
+      "COMM:7:4194304:null": 24,
+      "COMP:113": 8,
+      "COMP:118": 4,
+      "COMP:133": 4,
+      "COMP:135": 8,
+      "COMP:19": 16,
+      "COMP:193": 8,
+      "COMP:201": 4,
+      "COMP:22": 8,
+      "COMP:231": 4,
+      "COMP:25": 8,
+      "COMP:295": 8,
+      "COMP:33": 16,
+      "COMP:37": 8,
+      "COMP:393": 4,
+      "COMP:425": 4,
+      "COMP:43": 8,
+      "COMP:564": 4,
+      "COMP:6271": 1,
+      "RECV:1": 2,
+      "RECV:2097152": 2,
+      "SEND:1": 2,
+      "SEND:2097152": 2
+     },
+     "1": {
+      "COMM:2:2097152:null": 24,
+      "COMM:7:4194304:null": 24,
+      "COMP:113": 8,
+      "COMP:118": 4,
+      "COMP:133": 4,
+      "COMP:135": 8,
+      "COMP:19": 16,
+      "COMP:193": 8,
+      "COMP:201": 4,
+      "COMP:22": 8,
+      "COMP:231": 4,
+      "COMP:25": 8,
+      "COMP:295": 8,
+      "COMP:33": 16,
+      "COMP:37": 8,
+      "COMP:393": 4,
+      "COMP:43": 8,
+      "COMP:564": 4,
+      "COMP:6271": 1,
+      "RECV:1": 2,
+      "RECV:2097152": 2,
+      "SEND:1": 2,
+      "SEND:2097152": 2
+     },
+     "2": {
+      "COMM:2:2097152:null": 24,
+      "COMM:7:4194304:null": 24,
+      "COMP:113": 8,
+      "COMP:118": 4,
+      "COMP:133": 4,
+      "COMP:135": 8,
+      "COMP:1648": 2,
+      "COMP:19": 16,
+      "COMP:193": 8,
+      "COMP:201": 4,
+      "COMP:22": 8,
+      "COMP:231": 4,
+      "COMP:25": 8,
+      "COMP:295": 8,
+      "COMP:33": 16,
+      "COMP:37": 8,
+      "COMP:393": 4,
+      "COMP:43": 8,
+      "COMP:4427": 1,
+      "COMP:564": 4,
+      "COMP:756": 2,
+      "RECV:1": 2,
+      "RECV:2097152": 2,
+      "SEND:1": 2,
+      "SEND:2097152": 2
+     },
+     "3": {
+      "COMM:2:2097152:null": 24,
+      "COMM:7:4194304:null": 24,
+      "COMP:113": 8,
+      "COMP:118": 4,
+      "COMP:133": 4,
+      "COMP:135": 8,
+      "COMP:19": 16,
+      "COMP:193": 8,
+      "COMP:201": 4,
+      "COMP:22": 8,
+      "COMP:231": 4,
+      "COMP:25": 8,
+      "COMP:295": 8,
+      "COMP:33": 16,
+      "COMP:37": 8,
+      "COMP:393": 4,
+      "COMP:43": 8,
+      "COMP:4427": 1,
+      "COMP:564": 4,
+      "RECV:1": 2,
+      "RECV:2097152": 2,
+      "SEND:1": 2,
+      "SEND:2097152": 2
+     }
+    },
+    "version": "df-astra-manifest/1"
+   },
+   "manifest_sha256": "47454345a9fd1bbd8b30a38e9f5b7073760c03763a5ace21786e3c7dd6721f53",
+   "n_ranks": 4,
+   "n_recv": 16,
+   "n_transfers": 16,
+   "ranks": {
+    "0": {
+     "bytes_by_kind": {
+      "COLL": 150994944,
+      "RECV": 4194306,
+      "SEND": 4194306
+     },
+     "compute_micros": 22267,
+     "critical_path_nodes": 125,
+     "critical_path_weight": 2114973,
+     "dag_hash": "8253cc87445f02cb8fcbfea0649966e95e0603c781a8f565538a17d2a0d7e61c",
+     "n_nodes": 181,
+     "op_counts": {
+      "COLL": 48,
+      "COMP": 125,
+      "RECV": 4,
+      "SEND": 4
+     },
+     "ops_hash": "9b9a052876998cc3c970106f3356d88694546f660dde7b32ede1d12ce32665bd"
+    },
+    "1": {
+     "bytes_by_kind": {
+      "COLL": 150994944,
+      "RECV": 4194306,
+      "SEND": 4194306
+     },
+     "compute_micros": 20567,
+     "critical_path_nodes": 122,
+     "critical_path_weight": 2114123,
+     "dag_hash": "9d0bc1721af969db337999afbb3eb1858c4649bc79c53c695445c0a277e0f948",
+     "n_nodes": 177,
+     "op_counts": {
+      "COLL": 48,
+      "COMP": 121,
+      "RECV": 4,
+      "SEND": 4
+     },
+     "ops_hash": "1a1629c3e2bd40d1f322936ac9162e2fdefd0e22bcaa1949b20c72ba1088099a"
+    },
+    "2": {
+     "bytes_by_kind": {
+      "COLL": 150994944,
+      "RECV": 4194306,
+      "SEND": 4194306
+     },
+     "compute_micros": 23531,
+     "critical_path_nodes": 126,
+     "critical_path_weight": 4213408,
+     "dag_hash": "ef5f4ac8dc5c7181b44f0e064a0852f45d3f32336c322f56878dc4cf30cfa29c",
+     "n_nodes": 181,
+     "op_counts": {
+      "COLL": 48,
+      "COMP": 125,
+      "RECV": 4,
+      "SEND": 4
+     },
+     "ops_hash": "9eac6f39cf8e323cf86783c1b6accf82588475090714c8279b253a226547d2c5"
+    },
+    "3": {
+     "bytes_by_kind": {
+      "COLL": 150994944,
+      "RECV": 4194306,
+      "SEND": 4194306
+     },
+     "compute_micros": 18723,
+     "critical_path_nodes": 122,
+     "critical_path_weight": 4208600,
+     "dag_hash": "02c9a68f540ca88c45f67c4df240518bf8d5b23d07cb349de299bae3643d1b39",
+     "n_nodes": 177,
+     "op_counts": {
+      "COLL": 48,
+      "COMP": 121,
+      "RECV": 4,
+      "SEND": 4
+     },
+     "ops_hash": "7f854eee3e9870087c9cc0d95a9d86f2514554734e3fb5b60e134e7935421c1d"
+    }
+   }
+  }
+ },
+ "dlsim_ok": {
+  "flat": true
+ },
+ "error_tail": "",
+ "git_rev": "85e635b",
+ "memory": {
+  "LLM": {
+   "fields": {
+    "hardware_memory_capacity_per_gpu": 80.0,
+    "remaining_memory_headroom": 77.92,
+    "simulated_peak_memory_usage_per_gpu": 2.08,
+    "simulation_mode": "training"
+   },
+   "warnings": []
+  }
+ },
+ "p2p_ok": {
+  "flat": true
+ },
+ "phase_times": {},
+ "spec_id": "train:flattened:dp1tp2cp1pp2mb2sp1:recompute",
+ "status": "ok",
+ "total_time": 0.03373112
+}
